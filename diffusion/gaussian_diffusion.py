@@ -19,6 +19,8 @@ from data_loaders.humanml.scripts import motion_process
 from utils.loss_util import masked_l2, masked_goal_l2
 from data_loaders.humanml.scripts.motion_process import get_target_location
 
+from diffusion.losses import rot6d_to_quaternion
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
     Get a pre-defined beta schedule for the given name.
@@ -127,7 +129,7 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
-        lambda_rcxyz=0.,
+        lambda_rcxyz=0.5,
         lambda_vel=0.,
         lambda_pose=1.,
         lambda_orient=1.,
@@ -136,6 +138,7 @@ class GaussianDiffusion:
         lambda_root_vel=0.,
         lambda_vel_rcxyz=0.,
         lambda_fc=0.,
+        lambda_geo=0.,
         lambda_target_loc=0.,
         **kargs,
     ):
@@ -157,9 +160,11 @@ class GaussianDiffusion:
         self.lambda_root_vel = lambda_root_vel
         self.lambda_vel_rcxyz = lambda_vel_rcxyz
         self.lambda_fc = lambda_fc
+        self.lambda_geo = lambda_geo  # SO(3) geodesic loss weight
 
         if self.lambda_rcxyz > 0. or self.lambda_vel > 0. or self.lambda_root_vel > 0. or \
-                self.lambda_vel_rcxyz > 0. or self.lambda_fc > 0. or self.lambda_target_loc > 0.:
+                self.lambda_vel_rcxyz > 0. or self.lambda_fc > 0. or self.lambda_target_loc > 0. or \
+                self.lambda_geo > 0.:
             assert self.loss_type == LossType.MSE, 'Geometric losses are supported by MSE loss type only!'
 
         # Use float64 for accuracy.
@@ -1346,12 +1351,33 @@ class GaussianDiffusion:
                                             model_kwargs['y']['target_joint_names'], model_kwargs['y']['is_heading'])
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
                             
+            if self.lambda_geo > 0.:
+                # Convert both target and model_output from rot6d to quaternions
+                target_quats = rot6d_to_quaternion(target)  # [bs, njoints, 4, nframes]
+                model_output_quats = rot6d_to_quaternion(model_output)  # [bs, njoints, 4, nframes]
+                
+                # Compute geodesic distance for each joint
+                geo_dist = geodesic_distance(target_quats, model_output_quats)  # [bs, njoints]
+                
+                # Expand mask to match quaternion dimensions
+                expanded_mask = mask.unsqueeze(-1).expand_as(target_quats)  # [bs, njoints, 4, nframes]
+                
+                # Apply mask and compute mean squared error across joints and frames
+                masked_geo_dist = geo_dist * expanded_mask[..., 0]  # Use first component for mask
+                
+                # Compute mean squared error for geodesic distance
+                terms["geo_mse"] = masked_l2(
+                    target_quats.reshape(target_quats.shape[0], -1), 
+                    model_output_quats.reshape(model_output_quats.shape[0], -1),
+                    expanded_mask.reshape(expanded_mask.shape[0], -1)
+                )
 
             terms["loss"] = terms["rot_mse"] + terms.get('vb', 0.) +\
                             (self.lambda_vel * terms.get('vel_mse', 0.)) +\
                             (self.lambda_rcxyz * terms.get('rcxyz_mse', 0.)) + \
                             (self.lambda_target_loc * terms.get('target_loc', 0.)) + \
-                            (self.lambda_fc * terms.get('fc', 0.))
+                            (self.lambda_fc * terms.get('fc', 0.)) + \
+                            (self.lambda_geo * terms.get('geo_mse', 0.))
 
         else:
             raise NotImplementedError(self.loss_type)

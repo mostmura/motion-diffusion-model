@@ -112,6 +112,7 @@ def create_gaussian_diffusion(args):
         lambda_vel=args.lambda_vel,
         lambda_rcxyz=args.lambda_rcxyz,
         lambda_fc=args.lambda_fc,
+        lambda_geo=args.lambda_geo,
         lambda_target_loc=lambda_target_loc,
     )
 

@@ -75,3 +75,144 @@ def discretized_gaussian_log_likelihood(x, *, means, log_scales):
     )
     assert log_probs.shape == x.shape
     return log_probs
+
+
+def geodesic_distance(q1, q2):
+    """
+    Compute geodesic distance between two quaternions on SO(3).
+    q1, q2: tensors of shape (batch_size, num_joints, 4)
+    Returns: tensor of shape (batch_size, num_joints) with geodesic distances
+    """
+    # Normalize quaternions
+    q1 = qnormalize(q1)
+    q2 = qnormalize(q2)
+    
+    # Compute relative quaternion: q1 * qinv(q2)
+    q_rel = qmul(q1, qinv(q2))
+    
+    # Extract scalar part (w component)
+    w = q_rel[..., 0]
+    
+    # Geodesic distance = 2 * arccos(|w|)
+    # Clamp w to [-1, 1] for numerical stability
+    w = th.clamp(w, -1.0, 1.0)
+    return 2 * th.acos(th.abs(w))
+
+
+def rot6d_to_quaternion(rot6d):
+    """
+    Convert 6D rotation representation to quaternion.
+    rot6d: tensor of shape (batch_size, num_joints, 6)
+    Returns: tensor of shape (batch_size, num_joints, 4)
+    """
+    # Convert 6D to rotation matrix using existing cont6d_to_matrix function
+    # Note: This function is defined in data_loaders/humanml/common/skeleton.py
+    # We'll use the same logic here
+    x_raw = rot6d[..., 0:3]
+    y_raw = rot6d[..., 3:6]
+    
+    # Normalize x
+    x = x_raw / th.norm(x_raw, dim=-1, keepdim=True)
+    
+    # Orthogonalize y with respect to x
+    y = y_raw - th.sum(y_raw * x, dim=-1, keepdim=True) * x
+    y = y / th.norm(y, dim=-1, keepdim=True)
+    
+    # Compute z as cross product of x and y
+    z = th.cross(x, y, dim=-1)
+    
+    # Construct rotation matrix: [x, y, z] as columns
+    # Shape: (batch_size, num_joints, 3, 3)
+    R = th.stack([x, y, z], dim=-1)
+    
+    # Convert rotation matrix to quaternion
+    # Using the inverse of quaternion_to_matrix
+    trace = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    
+    # Handle different cases based on trace value
+    q = th.zeros_like(R[..., 0])
+    
+    # Case 1: trace > 0
+    mask1 = trace > 0
+    s = 0.5 / th.sqrt(trace + 1.0)
+    q[mask1, 0] = 0.25 / s  # w
+    q[mask1, 1] = (R[mask1, 2, 1] - R[mask1, 1, 2]) * s  # x
+    q[mask1, 2] = (R[mask1, 0, 2] - R[mask1, 2, 0]) * s  # y
+    q[mask1, 3] = (R[mask1, 1, 0] - R[mask1, 0, 1]) * s  # z
+    
+    # Case 2: trace <= 0, find largest diagonal element
+    mask2 = ~mask1
+    i = th.argmax(th.stack([R[mask2, 0, 0], R[mask2, 1, 1], R[mask2, 2, 2]], dim=-1), dim=-1)
+    
+    # Create masks for each case
+    j = (i + 1) % 3
+    k = (i + 2) % 3
+    
+    # For each diagonal element, compute quaternion components
+    mask_i0 = mask2 & (i == 0)
+    mask_i1 = mask2 & (i == 1)
+    mask_i2 = mask2 & (i == 2)
+    
+    s_i0 = 2.0 * th.sqrt(1.0 + R[mask_i0, 0, 0] - R[mask_i0, 1, 1] - R[mask_i0, 2, 2])
+    q[mask_i0, 0] = (R[mask_i0, 2, 1] - R[mask_i0, 1, 2]) / s_i0
+    q[mask_i0, 1] = 0.25 * s_i0
+    q[mask_i0, 2] = (R[mask_i0, 0, 1] + R[mask_i0, 1, 0]) / s_i0
+    q[mask_i0, 3] = (R[mask_i0, 0, 2] + R[mask_i0, 2, 0]) / s_i0
+    
+    s_i1 = 2.0 * th.sqrt(1.0 + R[mask_i1, 1, 1] - R[mask_i1, 0, 0] - R[mask_i1, 2, 2])
+    q[mask_i1, 0] = (R[mask_i1, 0, 2] - R[mask_i1, 2, 0]) / s_i1
+    q[mask_i1, 1] = (R[mask_i1, 0, 1] + R[mask_i1, 1, 0]) / s_i1
+    q[mask_i1, 2] = 0.25 * s_i1
+    q[mask_i1, 3] = (R[mask_i1, 1, 2] + R[mask_i1, 2, 1]) / s_i1
+    
+    s_i2 = 2.0 * th.sqrt(1.0 + R[mask_i2, 2, 2] - R[mask_i2, 0, 0] - R[mask_i2, 1, 1])
+    q[mask_i2, 0] = (R[mask_i2, 1, 0] - R[mask_i2, 0, 1]) / s_i2
+    q[mask_i2, 1] = (R[mask_i2, 0, 2] + R[mask_i2, 2, 0]) / s_i2
+    q[mask_i2, 2] = (R[mask_i2, 1, 2] + R[mask_i2, 2, 1]) / s_i2
+    q[mask_i2, 3] = 0.25 * s_i2
+    
+    return q
+
+
+def qnormalize(q):
+    """
+    Normalize quaternion.
+    q: tensor of shape (*, 4)
+    Returns: normalized quaternion
+    """
+    assert q.shape[-1] == 4, 'q must be a tensor of shape (*, 4)'
+    q[..., -1] += 1e-4  # Guy - for safety, avoid zero division
+    return q / th.norm(q, dim=-1, keepdim=True)
+
+
+def qinv(q):
+    """
+    Invert quaternion.
+    q: tensor of shape (*, 4)
+    Returns: inverted quaternion
+    """
+    assert q.shape[-1] == 4, 'q must be a tensor of shape (*, 4)'
+    mask = th.ones_like(q)
+    mask[..., 1:] = -mask[..., 1:]
+    return q * mask
+
+
+def qmul(q, r):
+    """
+    Multiply quaternion(s) q with quaternion(s) r.
+    Expects two equally-sized tensors of shape (*, 4), where * denotes any number of dimensions.
+    Returns q*r as a tensor of shape (*, 4).
+    """
+    assert q.shape[-1] == 4
+    assert r.shape[-1] == 4
+
+    original_shape = q.shape
+
+    # Compute outer product
+    terms = th.bmm(r.reshape(-1, 4, 1), q.reshape(-1, 1, 4))
+
+    w = terms[:, 0, 0] - terms[:, 1, 1] - terms[:, 2, 2] - terms[:, 3, 3]
+    x = terms[:, 0, 1] + terms[:, 1, 0] - terms[:, 2, 3] + terms[:, 3, 2]
+    y = terms[:, 0, 2] + terms[:, 1, 3] + terms[:, 2, 0] - terms[:, 3, 1]
+    z = terms[:, 0, 3] - terms[:, 1, 2] + terms[:, 2, 1] + terms[:, 3, 0]
+    return th.stack((w, x, y, z), dim=1).view(original_shape)

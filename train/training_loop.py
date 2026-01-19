@@ -341,9 +341,15 @@ class TrainLoop:
                 )
 
             loss = (losses["loss"] * weights).mean()
+
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
+
+            if self.total_step() % (self.log_interval) == 0:
+                print(f"DEBUG: lambda params: pose = {self.diffusion.lambda_pose}, vel = {self.diffusion.lambda_vel}, rcxyz = {self.diffusion.lambda_rcxyz}, fc = {self.diffusion.lambda_fc}")
+                print(f"DEBUG: loss components: rot_mse = {losses.get('rot_mse', 'N/A')}, vel = {losses.get('vel_mse', 'N/A')}, rcxyz = {losses.get('rcxyz_mse', 'N/A')}, fc = {losses.get('fc', 'N/A')}")
+
             self.mp_trainer.backward(loss)
 
     def _anneal_lr(self):

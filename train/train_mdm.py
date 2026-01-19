@@ -12,6 +12,8 @@ from train.training_loop import TrainLoop
 from data_loaders.get_data import get_dataset_loader
 from utils.model_util import create_model_and_diffusion
 from train.train_platforms import WandBPlatform, ClearmlPlatform, TensorboardPlatform, NoPlatform  # required for the eval operation
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 
 import torch
 if torch.cuda.is_available():

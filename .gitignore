@@ -139,3 +139,7 @@ slurm**/
 *.err
 *.slurm
 .vscode/
+
+dataset/HumanML3D
+dataset/HumanML3D_old
+dataset/KIT-ML

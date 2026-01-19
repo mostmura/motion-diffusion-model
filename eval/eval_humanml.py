@@ -17,21 +17,36 @@ from train.train_platforms import ClearmlPlatform, TensorboardPlatform, NoPlatfo
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-def evaluate_matching_score(eval_wrapper, motion_loaders, file):
+def evaluate_matching_score(eval_wrapper, motion_loaders, file, num_samples_limit=None):
+    """
+    This function processes BOTH ground truth AND generated samples
+    """
     match_score_dict = OrderedDict({})
     R_precision_dict = OrderedDict({})
     activation_dict = OrderedDict({})
     print('========== Evaluating Matching Score ==========')
+    
     for motion_loader_name, motion_loader in motion_loaders.items():
         all_motion_embeddings = []
-        score_list = []
         all_size = 0
         matching_score_sum = 0
         top_k_count = 0
-        # print(motion_loader_name)
+        skipped_batches = 0
+        
         with torch.no_grad():
             for idx, batch in enumerate(motion_loader):
+                # Apply sample limit
+                if num_samples_limit is not None and all_size >= num_samples_limit:
+                    break
+                
                 word_embeddings, pos_one_hots, _, sent_lens, motions, m_lens, _ = batch
+                
+                # Check for NaN/Inf
+                if (torch.isnan(motions).any() or torch.isinf(motions).any() or
+                    torch.isnan(word_embeddings).any() or torch.isinf(word_embeddings).any()):
+                    skipped_batches += 1
+                    continue
+                
                 text_embeddings, motion_embeddings = eval_wrapper.get_co_embeddings(
                     word_embs=word_embeddings,
                     pos_ohot=pos_one_hots,
@@ -39,21 +54,58 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
                     motions=motions,
                     m_lens=m_lens
                 )
-                dist_mat = euclidean_distance_matrix(text_embeddings.cpu().numpy(),
-                                                     motion_embeddings.cpu().numpy())
+                
+                if (torch.isnan(text_embeddings).any() or torch.isinf(text_embeddings).any() or
+                    torch.isnan(motion_embeddings).any() or torch.isinf(motion_embeddings).any()):
+                    skipped_batches += 1
+                    continue
+                
+                # Truncate batch if needed
+                batch_size = text_embeddings.shape[0]
+                if num_samples_limit is not None:
+                    remaining = num_samples_limit - all_size
+                    if remaining < batch_size:
+                        text_embeddings = text_embeddings[:remaining]
+                        motion_embeddings = motion_embeddings[:remaining]
+                        batch_size = remaining
+                
+                text_emb_np = text_embeddings.cpu().numpy()
+                motion_emb_np = motion_embeddings.cpu().numpy()
+                
+                if (np.isnan(text_emb_np).any() or np.isinf(text_emb_np).any() or
+                    np.isnan(motion_emb_np).any() or np.isinf(motion_emb_np).any()):
+                    skipped_batches += 1
+                    continue
+                
+                dist_mat = euclidean_distance_matrix(text_emb_np, motion_emb_np)
+                
+                if np.isnan(dist_mat).any() or np.isinf(dist_mat).any():
+                    skipped_batches += 1
+                    continue
+                
                 matching_score_sum += dist_mat.trace()
-
                 argsmax = np.argsort(dist_mat, axis=1)
                 top_k_mat = calculate_top_k(argsmax, top_k=3)
                 top_k_count += top_k_mat.sum(axis=0)
+                all_size += batch_size
+                all_motion_embeddings.append(motion_emb_np)
 
-                all_size += text_embeddings.shape[0]
-
-                all_motion_embeddings.append(motion_embeddings.cpu().numpy())
-
-            all_motion_embeddings = np.concatenate(all_motion_embeddings, axis=0)
-            matching_score = matching_score_sum / all_size
-            R_precision = top_k_count / all_size
+            if skipped_batches > 0:
+                print(f'Warning: [{motion_loader_name}] Skipped {skipped_batches} batches due to NaN/Inf')
+                print(f'Warning: [{motion_loader_name}] Skipped {skipped_batches} batches', file=file, flush=True)
+            
+            print(f'[{motion_loader_name}] Collected {all_size} samples')
+            print(f'[{motion_loader_name}] Collected {all_size} samples', file=file, flush=True)
+            
+            if all_size == 0:
+                matching_score = float('nan')
+                R_precision = np.array([float('nan')] * 3)
+                all_motion_embeddings = np.array([])
+            else:
+                all_motion_embeddings = np.concatenate(all_motion_embeddings, axis=0)
+                matching_score = matching_score_sum / all_size
+                R_precision = top_k_count / all_size
+            
             match_score_dict[motion_loader_name] = matching_score
             R_precision_dict[motion_loader_name] = R_precision
             activation_dict[motion_loader_name] = all_motion_embeddings
@@ -70,29 +122,107 @@ def evaluate_matching_score(eval_wrapper, motion_loaders, file):
     return match_score_dict, R_precision_dict, activation_dict
 
 
-def evaluate_fid(eval_wrapper, groundtruth_loader, activation_dict, file):
+
+def evaluate_fid(eval_wrapper, groundtruth_loader, activation_dict, file, num_samples_limit=None):
+    """
+    Fixed version - only computes GT once and compares generated models against it
+    """
     eval_dict = OrderedDict({})
     gt_motion_embeddings = []
+    total_batches = 0
+    skipped_batches = 0
+    total_samples = 0
+    
     print('========== Evaluating FID ==========')
+    
+    # Compute ground truth embeddings (the reference distribution)
     with torch.no_grad():
         for idx, batch in enumerate(groundtruth_loader):
+            if num_samples_limit is not None and total_samples >= num_samples_limit:
+                break
+            
+            total_batches += 1
             _, _, _, sent_lens, motions, m_lens, _ = batch
+            
+            if torch.isnan(motions).any() or torch.isinf(motions).any():
+                skipped_batches += 1
+                print(f'Warning: Skipping GT batch {idx} due to NaN/Inf')
+                print(f'Warning: Skipping GT batch {idx} due to NaN/Inf', file=file, flush=True)
+                continue
+            
             motion_embeddings = eval_wrapper.get_motion_embeddings(
                 motions=motions,
                 m_lens=m_lens
             )
+            
+            if torch.isnan(motion_embeddings).any() or torch.isinf(motion_embeddings).any():
+                skipped_batches += 1
+                print(f'Warning: Skipping GT batch {idx} embeddings due to NaN/Inf')
+                print(f'Warning: Skipping GT batch {idx} embeddings due to NaN/Inf', file=file, flush=True)
+                continue
+            
+            # Truncate batch if needed
+            batch_size = motion_embeddings.shape[0]
+            if num_samples_limit is not None:
+                remaining = num_samples_limit - total_samples
+                if remaining < batch_size:
+                    motion_embeddings = motion_embeddings[:remaining]
+                    batch_size = remaining
+            
+            total_samples += batch_size
             gt_motion_embeddings.append(motion_embeddings.cpu().numpy())
+    
+    print(f'\n=== FID Ground Truth Diagnostics ===')
+    print(f'GT batches processed: {total_batches}')
+    print(f'GT batches skipped: {skipped_batches}')
+    print(f'GT samples collected: {total_samples}')
+    print(f'=================================\n')
+    
+    if len(gt_motion_embeddings) == 0:
+        print('Error: No valid ground truth embeddings!')
+        for model_name in activation_dict.keys():
+            if model_name != 'ground truth':  # Skip GT entry
+                eval_dict[model_name] = float('nan')
+        return eval_dict
+    
     gt_motion_embeddings = np.concatenate(gt_motion_embeddings, axis=0)
+    print(f'GT embeddings shape: {gt_motion_embeddings.shape}')
+    print(f'GT embeddings shape: {gt_motion_embeddings.shape}', file=file, flush=True)
+    
     gt_mu, gt_cov = calculate_activation_statistics(gt_motion_embeddings)
 
-    # print(gt_mu)
+    # Now compare each GENERATED model against GT
     for model_name, motion_embeddings in activation_dict.items():
+        # CRITICAL: Skip the 'ground truth' entry - we don't compare GT to itself!
+        if model_name == 'ground truth':
+            print(f'Skipping [{model_name}] - not computing FID for GT vs GT')
+            print(f'Skipping [{model_name}] - not computing FID for GT vs GT', file=file, flush=True)
+            continue
+        
+        print(f'\n=== {model_name} FID Evaluation ===')
+        print(f'Generated embeddings shape: {motion_embeddings.shape}')
+        print(f'GT embeddings shape: {gt_motion_embeddings.shape}')
+        print(f'Sample count difference: {abs(motion_embeddings.shape[0] - gt_motion_embeddings.shape[0])}')
+        
+        # Check for NaN/Inf
+        if np.isnan(motion_embeddings).any() or np.isinf(motion_embeddings).any():
+            print(f'Warning: [{model_name}] contains NaN/Inf, skipping')
+            print(f'Warning: [{model_name}] contains NaN/Inf, skipping', file=file, flush=True)
+            eval_dict[model_name] = float('nan')
+            continue
+        
         mu, cov = calculate_activation_statistics(motion_embeddings)
-        # print(mu)
-        fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
-        print(f'---> [{model_name}] FID: {fid:.4f}')
-        print(f'---> [{model_name}] FID: {fid:.4f}', file=file, flush=True)
-        eval_dict[model_name] = fid
+        
+        try:
+            fid = calculate_frechet_distance(gt_mu, gt_cov, mu, cov)
+            print(f'---> [{model_name}] FID: {fid:.4f}')
+            print(f'---> [{model_name}] FID: {fid:.4f}', file=file, flush=True)
+            eval_dict[model_name] = fid
+        except Exception as e:
+            print(f'Error calculating FID for [{model_name}]: {str(e)}')
+            print(f'Error calculating FID for [{model_name}]: {str(e)}', file=file, flush=True)
+            eval_dict[model_name] = float('nan')
+    
     return eval_dict
 
 
@@ -137,7 +267,7 @@ def get_metric_statistics(values, replication_times):
 
 
 def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times, 
-               diversity_times, mm_num_times, run_mm=False, eval_platform=None):
+               diversity_times, mm_num_times, run_mm=False, eval_platform=None, num_samples_limit=None):
     with open(log_file, 'w') as f:
         all_metrics = OrderedDict({'Matching Score': OrderedDict({}),
                                    'R_precision': OrderedDict({}),
@@ -161,7 +291,7 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
 
             print(f'Time: {datetime.now()}')
             print(f'Time: {datetime.now()}', file=f, flush=True)
-            fid_score_dict = evaluate_fid(eval_wrapper, gt_loader, acti_dict, f)
+            fid_score_dict = evaluate_fid(eval_wrapper, gt_loader, acti_dict, f, num_samples_limit=num_samples_limit)
 
             print(f'Time: {datetime.now()}')
             print(f'Time: {datetime.now()}', file=f, flush=True)
@@ -326,5 +456,5 @@ if __name__ == '__main__':
 
     eval_wrapper = EvaluatorMDMWrapper(args.dataset, dist_util.dev())
     evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times, 
-               diversity_times, mm_num_times, run_mm=run_mm, eval_platform=eval_platform)
+               diversity_times, mm_num_times, run_mm=run_mm, eval_platform=eval_platform, num_samples_limit=num_samples_limit)
     eval_platform.close()
