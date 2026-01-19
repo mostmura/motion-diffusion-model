@@ -102,12 +102,10 @@ def geodesic_distance(q1, q2):
 def rot6d_to_quaternion(rot6d):
     """
     Convert 6D rotation representation to quaternion.
-    rot6d: tensor of shape (batch_size, num_joints, 6)
-    Returns: tensor of shape (batch_size, num_joints, 4)
+    rot6d: tensor of shape (..., 6) where ... can be any batch dimensions
+    Returns: tensor of shape (..., 4) quaternion
     """
-    # Convert 6D to rotation matrix using existing cont6d_to_matrix function
-    # Note: This function is defined in data_loaders/humanml/common/skeleton.py
-    # We'll use the same logic here
+    # Extract x and y vectors from 6D representation
     x_raw = rot6d[..., 0:3]
     y_raw = rot6d[..., 3:6]
     
@@ -122,54 +120,53 @@ def rot6d_to_quaternion(rot6d):
     z = th.cross(x, y, dim=-1)
     
     # Construct rotation matrix: [x, y, z] as columns
-    # Shape: (batch_size, num_joints, 3, 3)
+    # Stack to get [..., 3, 3]
     R = th.stack([x, y, z], dim=-1)
     
-    # Convert rotation matrix to quaternion
-    # Using the inverse of quaternion_to_matrix
-    trace = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    # Convert rotation matrix to quaternion using Shepperd's method
+    batch_shape = R.shape[:-2]  # All dimensions except last 2
+    mat_flat = R.reshape(-1, 3, 3)  # [batch_product, 3, 3]
     
-    # Handle different cases based on trace value
-    q = th.zeros_like(R[..., 0])
+    trace = mat_flat[:, 0, 0] + mat_flat[:, 1, 1] + mat_flat[:, 2, 2]  # [batch_product]
+    
+    # Initialize quaternion tensor
+    q = th.zeros(mat_flat.shape[0], 4, dtype=R.dtype, device=R.device)
     
     # Case 1: trace > 0
     mask1 = trace > 0
-    s = 0.5 / th.sqrt(trace + 1.0)
-    q[mask1, 0] = 0.25 / s  # w
-    q[mask1, 1] = (R[mask1, 2, 1] - R[mask1, 1, 2]) * s  # x
-    q[mask1, 2] = (R[mask1, 0, 2] - R[mask1, 2, 0]) * s  # y
-    q[mask1, 3] = (R[mask1, 1, 0] - R[mask1, 0, 1]) * s  # z
+    s1 = 0.5 / th.sqrt(trace[mask1] + 1.0)
+    q[mask1, 0] = 0.25 / s1
+    q[mask1, 1] = (mat_flat[mask1, 2, 1] - mat_flat[mask1, 1, 2]) * s1
+    q[mask1, 2] = (mat_flat[mask1, 0, 2] - mat_flat[mask1, 2, 0]) * s1
+    q[mask1, 3] = (mat_flat[mask1, 1, 0] - mat_flat[mask1, 0, 1]) * s1
     
-    # Case 2: trace <= 0, find largest diagonal element
-    mask2 = ~mask1
-    i = th.argmax(th.stack([R[mask2, 0, 0], R[mask2, 1, 1], R[mask2, 2, 2]], dim=-1), dim=-1)
+    # Case 2: trace <= 0 (trace is smallest)
+    mask2 = (trace <= 0) & (mat_flat[:, 0, 0] >= mat_flat[:, 1, 1]) & (mat_flat[:, 0, 0] >= mat_flat[:, 2, 2])
+    s2 = 2.0 * th.sqrt(1.0 + mat_flat[mask2, 0, 0] - mat_flat[mask2, 1, 1] - mat_flat[mask2, 2, 2])
+    q[mask2, 0] = (mat_flat[mask2, 2, 1] - mat_flat[mask2, 1, 2]) / s2
+    q[mask2, 1] = 0.25 * s2
+    q[mask2, 2] = (mat_flat[mask2, 0, 1] + mat_flat[mask2, 1, 0]) / s2
+    q[mask2, 3] = (mat_flat[mask2, 0, 2] + mat_flat[mask2, 2, 0]) / s2
     
-    # Create masks for each case
-    j = (i + 1) % 3
-    k = (i + 2) % 3
+    # Case 3: m[1,1] is largest
+    mask3 = (trace <= 0) & (mat_flat[:, 1, 1] >= mat_flat[:, 2, 2]) & ~mask2
+    s3 = 2.0 * th.sqrt(1.0 + mat_flat[mask3, 1, 1] - mat_flat[mask3, 0, 0] - mat_flat[mask3, 2, 2])
+    q[mask3, 0] = (mat_flat[mask3, 0, 2] - mat_flat[mask3, 2, 0]) / s3
+    q[mask3, 1] = (mat_flat[mask3, 0, 1] + mat_flat[mask3, 1, 0]) / s3
+    q[mask3, 2] = 0.25 * s3
+    q[mask3, 3] = (mat_flat[mask3, 1, 2] + mat_flat[mask3, 2, 1]) / s3
     
-    # For each diagonal element, compute quaternion components
-    mask_i0 = mask2 & (i == 0)
-    mask_i1 = mask2 & (i == 1)
-    mask_i2 = mask2 & (i == 2)
+    # Case 4: m[2,2] is largest
+    mask4 = (trace <= 0) & ~mask2 & ~mask3
+    s4 = 2.0 * th.sqrt(1.0 + mat_flat[mask4, 2, 2] - mat_flat[mask4, 0, 0] - mat_flat[mask4, 1, 1])
+    q[mask4, 0] = (mat_flat[mask4, 1, 0] - mat_flat[mask4, 0, 1]) / s4
+    q[mask4, 1] = (mat_flat[mask4, 0, 2] + mat_flat[mask4, 2, 0]) / s4
+    q[mask4, 2] = (mat_flat[mask4, 1, 2] + mat_flat[mask4, 2, 1]) / s4
+    q[mask4, 3] = 0.25 * s4
     
-    s_i0 = 2.0 * th.sqrt(1.0 + R[mask_i0, 0, 0] - R[mask_i0, 1, 1] - R[mask_i0, 2, 2])
-    q[mask_i0, 0] = (R[mask_i0, 2, 1] - R[mask_i0, 1, 2]) / s_i0
-    q[mask_i0, 1] = 0.25 * s_i0
-    q[mask_i0, 2] = (R[mask_i0, 0, 1] + R[mask_i0, 1, 0]) / s_i0
-    q[mask_i0, 3] = (R[mask_i0, 0, 2] + R[mask_i0, 2, 0]) / s_i0
-    
-    s_i1 = 2.0 * th.sqrt(1.0 + R[mask_i1, 1, 1] - R[mask_i1, 0, 0] - R[mask_i1, 2, 2])
-    q[mask_i1, 0] = (R[mask_i1, 0, 2] - R[mask_i1, 2, 0]) / s_i1
-    q[mask_i1, 1] = (R[mask_i1, 0, 1] + R[mask_i1, 1, 0]) / s_i1
-    q[mask_i1, 2] = 0.25 * s_i1
-    q[mask_i1, 3] = (R[mask_i1, 1, 2] + R[mask_i1, 2, 1]) / s_i1
-    
-    s_i2 = 2.0 * th.sqrt(1.0 + R[mask_i2, 2, 2] - R[mask_i2, 0, 0] - R[mask_i2, 1, 1])
-    q[mask_i2, 0] = (R[mask_i2, 1, 0] - R[mask_i2, 0, 1]) / s_i2
-    q[mask_i2, 1] = (R[mask_i2, 0, 2] + R[mask_i2, 2, 0]) / s_i2
-    q[mask_i2, 2] = (R[mask_i2, 1, 2] + R[mask_i2, 2, 1]) / s_i2
-    q[mask_i2, 3] = 0.25 * s_i2
+    # Reshape back to original batch shape
+    q_shape = list(batch_shape) + [4]
+    q = q.reshape(q_shape)
     
     return q
 
@@ -208,11 +205,17 @@ def qmul(q, r):
 
     original_shape = q.shape
 
-    # Compute outer product
-    terms = th.bmm(r.reshape(-1, 4, 1), q.reshape(-1, 1, 4))
+    # Flatten all dimensions except the last (quaternion components)
+    q_flat = q.reshape(-1, 4)  # [batch_product, 4]
+    r_flat = r.reshape(-1, 4)  # [batch_product, 4]
+
+    # Compute outer product via bmm
+    terms = th.bmm(r_flat.unsqueeze(1), q_flat.unsqueeze(2))  # [batch_product, 4, 4]
 
     w = terms[:, 0, 0] - terms[:, 1, 1] - terms[:, 2, 2] - terms[:, 3, 3]
     x = terms[:, 0, 1] + terms[:, 1, 0] - terms[:, 2, 3] + terms[:, 3, 2]
     y = terms[:, 0, 2] + terms[:, 1, 3] + terms[:, 2, 0] - terms[:, 3, 1]
     z = terms[:, 0, 3] - terms[:, 1, 2] + terms[:, 2, 1] + terms[:, 3, 0]
-    return th.stack((w, x, y, z), dim=1).view(original_shape)
+    
+    result = th.stack((w, x, y, z), dim=1)  # [batch_product, 4]
+    return result.view(original_shape)
