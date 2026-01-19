@@ -19,8 +19,7 @@ from data_loaders.humanml.scripts import motion_process
 from utils.loss_util import masked_l2, masked_goal_l2
 from data_loaders.humanml.scripts.motion_process import get_target_location
 
-
-from diffusion.losses import rot6d_to_quaternion, geodesic_distance
+from diffusion.losses import rot6d_to_quaternion
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
@@ -1318,7 +1317,7 @@ class GaussianDiffusion:
                     model_output_xyz = get_xyz(model_output) if model_output_xyz is None else model_output_xyz
                     target_xyz_vel = (target_xyz[:, :, :, 1:] - target_xyz[:, :, :, :-1])
                     model_output_xyz_vel = (model_output_xyz[:, :, :, 1:] - model_output_xyz[:, :, :, :-1])
-                    terms["vel_xyz_mse"] = self.masked_l2(target_xyz_vel, model_output_xyz_vel, mask[..., 1:])
+                    terms["vel_xyz_mse"] = self.masked_l2(target_xyz_vel, model_output_xyz_vel, mask[:, :, :, 1:])
 
             if self.lambda_fc > 0.:
                 with torch.autograd.set_detect_anomaly(True):
@@ -1336,13 +1335,13 @@ class GaussianDiffusion:
                         pred_vel[~fc_mask] = 0
                         terms["fc"] = self.masked_l2(pred_vel,
                                                      torch.zeros(pred_vel.shape, device=pred_vel.device),
-                                                     mask[..., 1:])
+                                                     mask[:, :, :, 1:])
             if self.lambda_vel > 0.:
                 target_vel = (target[..., 1:] - target[..., :-1])
                 model_output_vel = (model_output[..., 1:] - model_output[..., :-1])
                 terms["vel_mse"] = self.masked_l2(target_vel[:, :-1, :, :], # Remove last joint, is the root location!
                                                   model_output_vel[:, :-1, :, :],
-                                                  mask[..., 1:])  # mean_flat((target_vel - model_output_vel) ** 2)
+                                                  mask[:, :, :, 1:])  # mean_flat((target_vel - model_output_vel) ** 2)
             
             if self.lambda_target_loc > 0.:
                 assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for now!'
@@ -1353,34 +1352,25 @@ class GaussianDiffusion:
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
                             
             if self.lambda_geo > 0.:
-                # Geodesic loss applies to rotation representations (rot6d).
-                # If the model is not outputting rot6d, skip geo loss to avoid shape mismatches.
-                if self.data_rep != 'rot6d':
-                    terms["geo_mse"] = 0.0
-                else:
-                    # Compute geodesic loss per-frame by converting 6D->quaternion per frame
-                    # target/model_output shape: [bs, njoints, nfeats(=6), nframes]
-                    bs, njoints, nfeats, nframes = target.shape
-
-                    # bring feats to last dim then merge batch and frames for per-frame conversion
-                    target_per_frame = target.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, nfeats)
-                    model_per_frame = model_output.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, nfeats)
-
-                    # convert rot6d->quaternion on (batch*frames, njoints, 6) -> (batch*frames, njoints, 4)
-                    target_quats = rot6d_to_quaternion(target_per_frame)
-                    model_quats = rot6d_to_quaternion(model_per_frame)
-
-                    # compute geodesic distance per (batch*frame, joint)
-                    geo_dist = geodesic_distance(target_quats, model_quats)  # [bs*nframes, njoints]
-
-                    # prepare per-frame mask: [bs, 1, 1, nframes] -> [bs, nframes]
-                    mask_frames = mask.squeeze(1).squeeze(1)  # [bs, nframes]
-                    mask_exp = mask_frames.reshape(bs * nframes, 1).expand(bs * nframes, njoints)
-
-                    # squared geodesic distance masked and averaged over valid entries
-                    masked_geo = (geo_dist ** 2) * mask_exp.float()
-                    denom = mask_exp.float().sum() * 1.0 + 1e-8
-                    terms["geo_mse"] = masked_geo.sum() / denom
+                # Convert both target and model_output from rot6d to quaternions
+                target_quats = rot6d_to_quaternion(target)  # [bs, njoints, 4, nframes]
+                model_output_quats = rot6d_to_quaternion(model_output)  # [bs, njoints, 4, nframes]
+                
+                # Compute geodesic distance for each joint
+                geo_dist = geodesic_distance(target_quats, model_output_quats)  # [bs, njoints]
+                
+                # Expand mask to match quaternion dimensions
+                expanded_mask = mask.unsqueeze(-1).expand_as(target_quats)  # [bs, njoints, 4, nframes]
+                
+                # Apply mask and compute mean squared error across joints and frames
+                masked_geo_dist = geo_dist * expanded_mask[..., 0]  # Use first component for mask
+                
+                # Compute mean squared error for geodesic distance
+                terms["geo_mse"] = masked_l2(
+                    target_quats.reshape(target_quats.shape[0], -1), 
+                    model_output_quats.reshape(model_output_quats.shape[0], -1),
+                    expanded_mask.reshape(expanded_mask.shape[0], -1)
+                )
 
             terms["loss"] = terms["rot_mse"] + terms.get('vb', 0.) +\
                             (self.lambda_vel * terms.get('vel_mse', 0.)) +\
@@ -1455,7 +1445,7 @@ class GaussianDiffusion:
         # plt.legend()
         # plt.show()
         return self.masked_l2(pred_joint_vel, torch.zeros(pred_joint_vel.shape, device=pred_joint_vel.device),
-                              mask[..., 1:])
+                              mask[:, :, :, 1:])
     # TODO - NOT USED YET, JUST COMMITING TO NOT DELETE THIS AND KEEP INITIAL IMPLEMENTATION, NOT DONE!
     def foot_contact_loss_humanml3d(self, target, model_output):
         # root_rot_velocity (B, seq_len, 1)
