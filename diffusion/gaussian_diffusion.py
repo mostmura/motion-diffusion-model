@@ -1359,12 +1359,15 @@ class GaussianDiffusion:
                     terms["geo_mse"] = 0.0
                 else:
                     # Compute geodesic loss per-frame by converting 6D->quaternion per frame
-                    # target/model_output shape: [bs, njoints, nfeats(=6), nframes]
+                    # target/model_output shape: [bs, njoints, nfeats, nframes] where nfeats may be > 6
+                    # Extract only the first 6 features (rotation representation)
                     bs, njoints, nfeats, nframes = target.shape
+                    target_rot6d = target[:, :, :6, :]  # [bs, njoints, 6, nframes]
+                    model_rot6d = model_output[:, :, :6, :]  # [bs, njoints, 6, nframes]
 
                     # bring feats to last dim then merge batch and frames for per-frame conversion
-                    target_per_frame = target.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, nfeats)
-                    model_per_frame = model_output.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, nfeats)
+                    target_per_frame = target_rot6d.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, 6)
+                    model_per_frame = model_rot6d.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, 6)
 
                     # convert rot6d->quaternion on (batch*frames, njoints, 6) -> (batch*frames, njoints, 4)
                     target_quats = rot6d_to_quaternion(target_per_frame)
