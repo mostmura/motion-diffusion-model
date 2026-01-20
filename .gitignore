@@ -143,3 +143,4 @@ slurm**/
 dataset/HumanML3D
 dataset/HumanML3D_old
 dataset/KIT-ML
+dataset/t2m_train.npy
