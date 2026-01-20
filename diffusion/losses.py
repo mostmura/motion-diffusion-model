@@ -209,8 +209,8 @@ def qmul(q, r):
     q_flat = q.reshape(-1, 4)  # [batch_product, 4]
     r_flat = r.reshape(-1, 4)  # [batch_product, 4]
 
-    # Compute outer product via bmm
-    terms = th.bmm(r_flat.unsqueeze(1), q_flat.unsqueeze(2))  # [batch_product, 4, 4]
+    # Compute outer product via bmm: [batch, 4, 1] @ [batch, 1, 4] = [batch, 4, 4]
+    terms = th.bmm(r_flat.unsqueeze(2), q_flat.unsqueeze(1))  # [batch_product, 4, 4]
 
     w = terms[:, 0, 0] - terms[:, 1, 1] - terms[:, 2, 2] - terms[:, 3, 3]
     x = terms[:, 0, 1] + terms[:, 1, 0] - terms[:, 2, 3] + terms[:, 3, 2]
