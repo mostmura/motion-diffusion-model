@@ -1352,75 +1352,102 @@ class GaussianDiffusion:
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
                             
             if self.lambda_geo > 0.:
+                # DEBUG: Print dataset info to understand what's happening
+
                 # Geodesic loss on rotation representation (6D rotations)
                 # target/model_output shape: [bs, njoints, nfeats, nframes]
 
                 bs, njoints, nfeats, nframes = target.shape
+
+                # print(f"DEBUG: Geodesic loss - dataset.dataname={dataset.dataname}, nfeats={nfeats}, njoints={njoints}")
+
 
                 # The 6D rotation data is not in the first 6 features per joint for HumanML3D/KIT datasets
                 # For these datasets, the structure is:
                 # [root_data(4), joint_rel_pos(3*(njoints-1)), joint_rot(6*(njoints-1)), local_vel, foot_contact]
                 # So rotation data for non-root joints starts at index 4 + 3*(njoints-1)
 
-                if dataset.dataname in ['humanml', 'kit']:
+                if dataset.dataname in ['humanml', 'kit', 't2m']:
+                    # print(f"DEBUG: Processing HumanML/KIT/T2M dataset - calculating rotation indices")
+                    # Use the actual number of joints from the dataset configuration, not the tensor dimension
+                    # The tensor dimension (njoints) is the total feature size, not the number of skeleton joints
+                    actual_joints_num = dataset.t2m_dataset.opt.joints_num
+                    # print(f"DEBUG: Using actual joints_num={actual_joints_num} instead of tensor njoints={njoints}")
+
                     # Calculate where rotation data starts for non-root joints
-                    rot_start_idx = 4 + (njoints - 1) * 3  # After root data and joint positions
-                    rot_end_idx = rot_start_idx + (njoints - 1) * 6  # Include 6 features per non-root joint
+                    # Data structure: [root_data(4), joint_rel_pos(3*(actual_joints_num-1)), joint_rot(6*(actual_joints_num-1)), local_vel, foot_contact]
+                    rot_start_idx = 4 + (actual_joints_num - 1) * 3  # After root data and joint positions
+                    rot_end_idx = rot_start_idx + (actual_joints_num - 1) * 6  # Include 6 features per non-root joint
+                    # print(f"DEBUG: rot_start_idx={rot_start_idx}, rot_end_idx={rot_end_idx}, nfeats={nfeats}")
 
                     # Check if we have enough features for rotation data
-                    if rot_end_idx <= nfeats:
+                    # rot_end_idx refers to the feature index in the njoints dimension
+                    if rot_end_idx <= njoints:
+                        # print(f"DEBUG: Sufficient features found, proceeding with geodesic loss computation")
                         # Extract rotation data for non-root joints only
-                        # The rotation data for non-root joints is stored consecutively
-                        # Shape: [bs, njoints, nfeats, nframes] -> [bs, njoints-1, 6*(njoints-1), nframes] (skip root joint)
-                        target_rot6d = target[:, 1:, rot_start_idx:rot_end_idx, :]  # [bs, njoints-1, 6*(njoints-1), nframes]
-                        model_rot6d = model_output[:, 1:, rot_start_idx:rot_end_idx, :]  # [bs, njoints-1, 6*(njoints-1), nframes]
+                        # The rotation data is stored in the feature dimension, not as separate "joints" in the tensor
+                        # Shape: [bs, total_features, nfeats, nframes] -> [bs, 1, 6*(actual_joints_num-1), nframes]
+                        target_rot6d = target[:, rot_start_idx:rot_end_idx, :, :]  # [bs, 6*(actual_joints_num-1), nfeats, nframes]
+                        model_rot6d = model_output[:, rot_start_idx:rot_end_idx, :, :]  # [bs, 6*(actual_joints_num-1), nfeats, nframes]
 
                         # Now we need to reshape so that each joint's 6D rotation is grouped together
-                        # target_rot6d shape: [bs, njoints-1, 6*(njoints-1), nframes]
-                        # For each of the njoints-1 non-root joints, we have 6 consecutive features
-                        # So we need to extract 6 features per joint for each of the njoints-1 joints
-                        bs_act, n_rot_joints, total_rot_features, nframes_act = target_rot6d.shape
+                        # target_rot6d shape: [bs, 6*(actual_joints_num-1), nfeats, nframes]
+                        # For each of the (actual_joints_num-1) non-root joints, we have 6 consecutive features
+                        bs_act, total_rot_features, nfeats_rot, nframes_act = target_rot6d.shape  # [bs, 6*(actual_joints_num-1), nfeats, nframes]
 
+                        # Number of rotation joints should be (actual_joints_num - 1)
+                        n_rot_joints = actual_joints_num - 1
                         # Validate that total_rot_features is indeed n_rot_joints * 6
                         expected_total_features = n_rot_joints * 6
                         if total_rot_features != expected_total_features:
                             print(f"ERROR: Expected {expected_total_features} rotation features, got {total_rot_features}")
                             terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
                         else:
-                            # Create new tensors to store the reshaped data
-                            target_rot6d_reshaped = target_rot6d.new_zeros(bs_act, n_rot_joints, 6, nframes_act)
-                            model_rot6d_reshaped = model_rot6d.new_zeros(bs_act, n_rot_joints, 6, nframes_act)
+                            # Debug: Check tensor sizes before reshaping
+                            # print(f"DEBUG: target_rot6d shape: {target_rot6d.shape}, size: {target_rot6d.numel()}")
+                            # print(f"DEBUG: model_rot6d shape: {model_rot6d.shape}, size: {model_rot6d.numel()}")
 
-                            # Extract 6 features per joint: for joint i, extract features [i*6 : (i+1)*6]
-                            for j_idx in range(n_rot_joints):
-                                start_feat = j_idx * 6
-                                end_feat = (j_idx + 1) * 6
-                                target_rot6d_reshaped[:, j_idx, :, :] = target_rot6d[:, j_idx, start_feat:end_feat, :]
-                                model_rot6d_reshaped[:, j_idx, :, :] = model_rot6d[:, j_idx, start_feat:end_feat, :]
+                            # Check if tensors are empty
+                            if target_rot6d.numel() == 0 or model_rot6d.numel() == 0:
+                                # print("DEBUG: One or both rotation tensors are empty!")
+                                terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                            elif th.isnan(target_rot6d).any() or th.isinf(target_rot6d).any() or th.isnan(model_rot6d).any() or th.isinf(model_rot6d).any():
+                                # print("DEBUG: One or both rotation tensors contain NaN or Inf values!")
+                                terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                            else:
+                                # Reshape rotation data: [bs, 6*(actual_joints_num-1), nfeats, nframes] -> [bs, actual_joints_num-1, 6, nframes]
+                                # This groups every 6 consecutive features as belonging to one joint
+                                # First, reshape [bs, total_rot_features, nfeats, nframes] to [bs, n_rot_joints, 6, nfeats, nframes]
+                                target_rot6d_reshaped = target_rot6d.view(bs_act, n_rot_joints, 6, nfeats_rot, nframes_act)  # [bs, 21, 6, 1, nframes]
+                                model_rot6d_reshaped = model_rot6d.view(bs_act, n_rot_joints, 6, nfeats_rot, nframes_act)  # [bs, 21, 6, 1, nframes]
 
-                            # Permute: [bs, n_rot_joints, 6, nframes] -> [bs, n_rot_joints, nframes, 6]
-                            target_rot6d_perm = target_rot6d_reshaped.permute(0, 1, 3, 2)
-                            model_rot6d_perm = model_rot6d_reshaped.permute(0, 1, 3, 2)
+                                # Now squeeze out the nfeats dimension (which is 1) to get [bs, 21, 6, nframes]
+                                target_rot6d_reshaped = target_rot6d_reshaped.squeeze(3)  # [bs, 21, 6, nframes]
+                                model_rot6d_reshaped = model_rot6d_reshaped.squeeze(3)  # [bs, 21, 6, nframes]
 
-                            # Now reshape: [bs, n_rot_joints, nframes, 6] -> [bs*nframes, n_rot_joints, 6]
-                            try:
-                                target_rot6d_flat = target_rot6d_perm.reshape(bs_act * nframes_act, n_rot_joints, 6)
-                                model_rot6d_flat = model_rot6d_perm.reshape(bs_act * nframes_act, n_rot_joints, 6)
+                                # Permute: [bs, n_rot_joints, 6, nframes] -> [bs, n_rot_joints, nframes, 6]
+                                target_rot6d_perm = target_rot6d_reshaped.permute(0, 1, 3, 2)
+                                model_rot6d_perm = model_rot6d_reshaped.permute(0, 1, 3, 2)
 
-                                # Check if the rotation data has sufficient variation
-                                target_rot_std = target_rot6d_flat.std()
-                                model_rot_std = model_rot6d_flat.std()
-                                
-                                if target_rot_std < 1e-6 or model_rot_std < 1e-6:
-                                    print(f"WARNING: Rotation data has insufficient variation (target_std={target_rot_std:.2e}, model_std={model_rot_std:.2e})")
-                                    terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
-                                else:
+                                # Now reshape: [bs, n_rot_joints, nframes, 6] -> [bs*nframes, n_rot_joints, 6]
+                                try:
+                                    # print(f"DEBUG: About to reshape target_rot6d_perm with shape {target_rot6d_perm.shape} to {(bs_act * nframes_act, n_rot_joints, 6)}")
+                                    target_rot6d_flat = target_rot6d_perm.reshape(bs_act * nframes_act, n_rot_joints, 6)
+                                    # print(f"DEBUG: Successfully reshaped target_rot6d_flat to {target_rot6d_flat.shape}")
+
+                                    # print(f"DEBUG: About to reshape model_rot6d_perm with shape {model_rot6d_perm.shape} to {(bs_act * nframes_act, n_rot_joints, 6)}")
+                                    model_rot6d_flat = model_rot6d_perm.reshape(bs_act * nframes_act, n_rot_joints, 6)
+                                    # print(f"DEBUG: Successfully reshaped model_rot6d_flat to {model_rot6d_flat.shape}")
+
                                     # Convert 6D rotation to quaternions: [bs*nframes, n_rot_joints, 6] -> [bs*nframes, n_rot_joints, 4]
+                                    # print(f"DEBUG: Converting 6D rotations to quaternions...")
                                     target_quats = rot6d_to_quaternion(target_rot6d_flat)
                                     model_quats = rot6d_to_quaternion(model_rot6d_flat)
+                                    # print(f"DEBUG: Conversion successful. Quat shapes: target={target_quats.shape}, model={model_quats.shape}")
 
                                     # Compute geodesic distance: [bs*nframes, n_rot_joints]
                                     geo_dist = geodesic_distance(target_quats, model_quats)
+                                    # print(f"DEBUG: Geodesic distance computed. Shape: {geo_dist.shape}")
 
                                     # Check for NaN or infinite values
                                     if th.isnan(geo_dist).any() or th.isinf(geo_dist).any():
@@ -1429,35 +1456,57 @@ class GaussianDiffusion:
                                         geo_dist = th.nan_to_num(geo_dist, nan=0.0, posinf=0.0, neginf=0.0)
 
                                     geo_dist = geo_dist.reshape(bs_act, nframes_act, n_rot_joints).permute(0, 2, 1)  # [bs, n_rot_joints, nframes]
+                                    # print(f"DEBUG: Reshaped geo_dist to {geo_dist.shape}")
 
-                                    # Prepare mask for the non-root joints: [bs, njoints, 1, nframes] -> [bs, n_rot_joints, nframes]
-                                    # Only apply to non-root joints (indices 1 to njoints-1)
-                                    mask_non_root = mask[:, 1:, :, :]  # [bs, n_rot_joints, 1, nframes]
-                                    mask_expanded = mask_non_root.squeeze(2).expand(bs_act, n_rot_joints, nframes_act)  # [bs, n_rot_joints, nframes]
+                                    # Prepare mask for the rotation joints: [bs, total_features, 1, nframes] -> [bs, n_rot_joints, nframes]
+                                    # The mask is [bs, 1, 1, nframes] and applies globally to all features at each time step
+                                    # print(f"DEBUG: Original mask shape: {mask.shape}")
+
+                                    # Expand the global mask to apply to each rotation joint
+                                    # mask shape is [bs, 1, 1, nframes], expand to [bs, n_rot_joints, nframes]
+                                    # First squeeze the singleton dimensions: [bs, 1, 1, nframes] -> [bs, nframes]
+                                    mask_squeezed = mask.squeeze(1).squeeze(1)  # [bs, nframes]
+                                    # Then expand to [bs, n_rot_joints, nframes]
+                                    mask_expanded = mask_squeezed.unsqueeze(1).expand(bs_act, n_rot_joints, nframes_act)  # [bs, n_rot_joints, nframes]
+                                    # print(f"DEBUG: Mask expanded shape: {mask_expanded.shape}")
 
                                     # Check if mask has any non-zero values
                                     mask_sum = mask_expanded.float().sum()
-                                    if mask_sum.item() == 0:
+
+                                    # Check for NaN/Inf in geo_dist before computing loss
+                                    if th.isnan(geo_dist).any() or th.isinf(geo_dist).any():
+                                        print("WARNING: NaN or Inf detected in geodesic distance, setting geo_mse to 0")
+                                        terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                                    elif mask_sum.item() == 0:
                                         print("WARNING: Mask sum is 0, geodesic loss will be 0")
                                         terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
                                     else:
                                         # Compute masked squared geodesic distance
                                         masked_geo = (geo_dist ** 2) * mask_expanded.float()
-                                        denom = mask_sum * 1.0 + 1e-8
-                                        terms["geo_mse"] = masked_geo.sum() / denom
-                            except RuntimeError as e:
-                                # Handle reshape error gracefully
-                                print(f"Geodesic loss reshape error: {str(e)}")
-                                print(f"Actual tensor shape after permute: {target_rot6d_perm.shape}")
-                                print(f"Target reshape dimensions: {(bs_act * nframes_act, n_rot_joints, 6)}")
-                                terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+
+                                        # Check for NaN/Inf in masked_geo
+                                        if th.isnan(masked_geo).any() or th.isinf(masked_geo).any():
+                                            print("WARNING: NaN or Inf detected in masked geodesic distance, setting geo_mse to 0")
+                                            terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                                        else:
+                                            denom = mask_sum * 1.0 + 1e-8
+                                            terms["geo_mse"] = masked_geo.sum() / denom
+                                except RuntimeError as e:
+                                    # Handle reshape error gracefully
+                                    print(f"Geodesic loss reshape error: {str(e)}")
+                                    print(f"Actual tensor shape after permute: {target_rot6d_perm.shape}")
+                                    print(f"Target reshape dimensions: {(bs_act * nframes_act, n_rot_joints, 6)}")
+                                    terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
                     else:
                         # Not enough features for rotation data
-                        print(f"Not enough features for rotation data. Need {rot_end_idx}, got {nfeats}")
+                        # print(f"DEBUG: Not enough features for rotation data. Need {rot_end_idx}, got {nfeats}")
+                        # print(f"DEBUG: Setting geo_mse to 0.0")
                         terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
                 else:
+                    # print(f"DEBUG: Processing rotation-based dataset - checking nfeats >= 6")
                     # For other datasets, use the original approach if we have enough features
                     if nfeats >= 6:
+                        # print(f"DEBUG: Sufficient features found (nfeats={nfeats} >= 6), proceeding with geodesic loss computation")
                         # Extract the first 6 features as 6D rotation representation (fallback)
                         target_rot6d = target[:, :, :6, :]  # [bs, njoints, 6, nframes]
                         model_rot6d = model_output[:, :, :6, :]  # [bs, njoints, 6, nframes]
@@ -1498,6 +1547,7 @@ class GaussianDiffusion:
                             terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
                     else:
                         # Not enough features for 6D rotation representation
+                        print(f"DEBUG: Not enough features for 6D rotation representation (nfeats={nfeats} < 6), setting geo_mse to 0.0")
                         terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
 
             terms["loss"] = terms["rot_mse"] + terms.get('vb', 0.) +\

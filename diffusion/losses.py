@@ -86,16 +86,17 @@ def geodesic_distance(q1, q2):
     # Normalize quaternions
     q1 = qnormalize(q1)
     q2 = qnormalize(q2)
-    
+
     # Compute relative quaternion: q1 * qinv(q2)
     q_rel = qmul(q1, qinv(q2))
-    
+
     # Extract scalar part (w component)
     w = q_rel[..., 0]
-    
+
     # Geodesic distance = 2 * arccos(|w|)
     # Clamp w to [-1, 1] for numerical stability
     w = th.clamp(w, -1.0, 1.0)
+    # Use torch.arccos for PyTorch compatibility
     return 2 * th.acos(th.abs(w))
 
 
@@ -178,20 +179,20 @@ def qnormalize(q):
     Returns: normalized quaternion
     """
     assert q.shape[-1] == 4, 'q must be a tensor of shape (*, 4)'
-    q[..., -1] += 1e-4  # Guy - for safety, avoid zero division
-    return q / th.norm(q, dim=-1, keepdim=True)
+    # Add small epsilon to avoid division by zero during normalization
+    return q / (th.norm(q, dim=-1, keepdim=True) + 1e-8)
 
 
 def qinv(q):
     """
     Invert quaternion.
+    For unit quaternions, the inverse is the conjugate.
     q: tensor of shape (*, 4)
     Returns: inverted quaternion
     """
     assert q.shape[-1] == 4, 'q must be a tensor of shape (*, 4)'
-    mask = th.ones_like(q)
-    mask[..., 1:] = -mask[..., 1:]
-    return q * mask
+    # For unit quaternions, inverse = conjugate: negate the imaginary parts (x, y, z)
+    return th.stack([q[..., 0], -q[..., 1], -q[..., 2], -q[..., 3]], dim=-1)
 
 
 def qmul(q, r):
@@ -209,13 +210,16 @@ def qmul(q, r):
     q_flat = q.reshape(-1, 4)  # [batch_product, 4]
     r_flat = r.reshape(-1, 4)  # [batch_product, 4]
 
-    # Compute outer product via bmm: [batch, 4, 1] @ [batch, 1, 4] = [batch, 4, 4]
-    terms = th.bmm(r_flat.unsqueeze(2), q_flat.unsqueeze(1))  # [batch_product, 4, 4]
+    # Quaternion multiplication formula:
+    # q*r = (qw*rw - qx*rx - qy*ry - qz*rz,
+    #        qw*rx + qx*rw + qy*rz - qz*ry,
+    #        qw*ry - qx*rz + qy*rw + qz*rx,
+    #        qw*rz + qx*ry - qy*rx + qz*rw)
 
-    w = terms[:, 0, 0] - terms[:, 1, 1] - terms[:, 2, 2] - terms[:, 3, 3]
-    x = terms[:, 0, 1] + terms[:, 1, 0] - terms[:, 2, 3] + terms[:, 3, 2]
-    y = terms[:, 0, 2] + terms[:, 1, 3] + terms[:, 2, 0] - terms[:, 3, 1]
-    z = terms[:, 0, 3] - terms[:, 1, 2] + terms[:, 2, 1] + terms[:, 3, 0]
-    
+    w = q_flat[:, 0] * r_flat[:, 0] - q_flat[:, 1] * r_flat[:, 1] - q_flat[:, 2] * r_flat[:, 2] - q_flat[:, 3] * r_flat[:, 3]
+    x = q_flat[:, 0] * r_flat[:, 1] + q_flat[:, 1] * r_flat[:, 0] + q_flat[:, 2] * r_flat[:, 3] - q_flat[:, 3] * r_flat[:, 2]
+    y = q_flat[:, 0] * r_flat[:, 2] - q_flat[:, 1] * r_flat[:, 3] + q_flat[:, 2] * r_flat[:, 0] + q_flat[:, 3] * r_flat[:, 1]
+    z = q_flat[:, 0] * r_flat[:, 3] + q_flat[:, 1] * r_flat[:, 2] - q_flat[:, 2] * r_flat[:, 1] + q_flat[:, 3] * r_flat[:, 0]
+
     result = th.stack((w, x, y, z), dim=1)  # [batch_product, 4]
     return result.view(original_shape)
