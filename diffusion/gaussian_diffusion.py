@@ -1407,36 +1407,44 @@ class GaussianDiffusion:
                                 target_rot6d_flat = target_rot6d_perm.reshape(bs_act * nframes_act, n_rot_joints, 6)
                                 model_rot6d_flat = model_rot6d_perm.reshape(bs_act * nframes_act, n_rot_joints, 6)
 
-                                # Convert 6D rotation to quaternions: [bs*nframes, n_rot_joints, 6] -> [bs*nframes, n_rot_joints, 4]
-                                target_quats = rot6d_to_quaternion(target_rot6d_flat)
-                                model_quats = rot6d_to_quaternion(model_rot6d_flat)
-
-                                # Compute geodesic distance: [bs*nframes, n_rot_joints]
-                                geo_dist = geodesic_distance(target_quats, model_quats)
-
-                                # Check for NaN or infinite values
-                                if th.isnan(geo_dist).any() or th.isinf(geo_dist).any():
-                                    print("WARNING: Found NaN or Inf values in geodesic distance")
-                                    # Replace NaN/Inf with 0
-                                    geo_dist = th.nan_to_num(geo_dist, nan=0.0, posinf=0.0, neginf=0.0)
-
-                                geo_dist = geo_dist.reshape(bs_act, nframes_act, n_rot_joints).permute(0, 2, 1)  # [bs, n_rot_joints, nframes]
-
-                                # Prepare mask for the non-root joints: [bs, njoints, 1, nframes] -> [bs, n_rot_joints, nframes]
-                                # Only apply to non-root joints (indices 1 to njoints-1)
-                                mask_non_root = mask[:, 1:, :, :]  # [bs, n_rot_joints, 1, nframes]
-                                mask_expanded = mask_non_root.squeeze(2).expand(bs_act, n_rot_joints, nframes_act)  # [bs, n_rot_joints, nframes]
-
-                                # Check if mask has any non-zero values
-                                mask_sum = mask_expanded.float().sum()
-                                if mask_sum.item() == 0:
-                                    print("WARNING: Mask sum is 0, geodesic loss will be 0")
+                                # Check if the rotation data has sufficient variation
+                                target_rot_std = target_rot6d_flat.std()
+                                model_rot_std = model_rot6d_flat.std()
+                                
+                                if target_rot_std < 1e-6 or model_rot_std < 1e-6:
+                                    print(f"WARNING: Rotation data has insufficient variation (target_std={target_rot_std:.2e}, model_std={model_rot_std:.2e})")
                                     terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
                                 else:
-                                    # Compute masked squared geodesic distance
-                                    masked_geo = (geo_dist ** 2) * mask_expanded.float()
-                                    denom = mask_sum * 1.0 + 1e-8
-                                    terms["geo_mse"] = masked_geo.sum() / denom
+                                    # Convert 6D rotation to quaternions: [bs*nframes, n_rot_joints, 6] -> [bs*nframes, n_rot_joints, 4]
+                                    target_quats = rot6d_to_quaternion(target_rot6d_flat)
+                                    model_quats = rot6d_to_quaternion(model_rot6d_flat)
+
+                                    # Compute geodesic distance: [bs*nframes, n_rot_joints]
+                                    geo_dist = geodesic_distance(target_quats, model_quats)
+
+                                    # Check for NaN or infinite values
+                                    if th.isnan(geo_dist).any() or th.isinf(geo_dist).any():
+                                        print("WARNING: Found NaN or Inf values in geodesic distance")
+                                        # Replace NaN/Inf with 0
+                                        geo_dist = th.nan_to_num(geo_dist, nan=0.0, posinf=0.0, neginf=0.0)
+
+                                    geo_dist = geo_dist.reshape(bs_act, nframes_act, n_rot_joints).permute(0, 2, 1)  # [bs, n_rot_joints, nframes]
+
+                                    # Prepare mask for the non-root joints: [bs, njoints, 1, nframes] -> [bs, n_rot_joints, nframes]
+                                    # Only apply to non-root joints (indices 1 to njoints-1)
+                                    mask_non_root = mask[:, 1:, :, :]  # [bs, n_rot_joints, 1, nframes]
+                                    mask_expanded = mask_non_root.squeeze(2).expand(bs_act, n_rot_joints, nframes_act)  # [bs, n_rot_joints, nframes]
+
+                                    # Check if mask has any non-zero values
+                                    mask_sum = mask_expanded.float().sum()
+                                    if mask_sum.item() == 0:
+                                        print("WARNING: Mask sum is 0, geodesic loss will be 0")
+                                        terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                                    else:
+                                        # Compute masked squared geodesic distance
+                                        masked_geo = (geo_dist ** 2) * mask_expanded.float()
+                                        denom = mask_sum * 1.0 + 1e-8
+                                        terms["geo_mse"] = masked_geo.sum() / denom
                             except RuntimeError as e:
                                 # Handle reshape error gracefully
                                 print(f"Geodesic loss reshape error: {str(e)}")
