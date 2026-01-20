@@ -1352,25 +1352,35 @@ class GaussianDiffusion:
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
                             
             if self.lambda_geo > 0.:
-                # Convert both target and model_output from rot6d to quaternions
-                target_quats = rot6d_to_quaternion(target)  # [bs, njoints, 4, nframes]
-                model_output_quats = rot6d_to_quaternion(model_output)  # [bs, njoints, 4, nframes]
+                # Geodesic loss on rotation representation (first 6 features are 6D rotation)
+                # target/model_output shape: [bs, njoints, nfeats, nframes]
+                # Extract rotation features (first 6) and process per-frame
                 
-                # Compute geodesic distance for each joint
-                geo_dist = geodesic_distance(target_quats, model_output_quats)  # [bs, njoints]
+                bs, njoints, nfeats, nframes = target.shape
                 
-                # Expand mask to match quaternion dimensions
-                expanded_mask = mask.unsqueeze(-1).expand_as(target_quats)  # [bs, njoints, 4, nframes]
+                # Extract first 6 rotation features: [bs, njoints, 6, nframes]
+                target_rot6d = target[:, :, :6, :]
+                model_rot6d = model_output[:, :, :6, :]
                 
-                # Apply mask and compute mean squared error across joints and frames
-                masked_geo_dist = geo_dist * expanded_mask[..., 0]  # Use first component for mask
+                # Permute and reshape for per-frame processing: [bs, njoints, nframes, 6] -> [bs*nframes, njoints, 6]
+                target_rot6d_flat = target_rot6d.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, 6)
+                model_rot6d_flat = model_rot6d.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, 6)
                 
-                # Compute mean squared error for geodesic distance
-                terms["geo_mse"] = masked_l2(
-                    target_quats.reshape(target_quats.shape[0], -1), 
-                    model_output_quats.reshape(model_output_quats.shape[0], -1),
-                    expanded_mask.reshape(expanded_mask.shape[0], -1)
-                )
+                # Convert 6D rotation to quaternions: [bs*nframes, njoints, 6] -> [bs*nframes, njoints, 4]
+                target_quats = rot6d_to_quaternion(target_rot6d_flat)
+                model_quats = rot6d_to_quaternion(model_rot6d_flat)
+                
+                # Compute geodesic distance: [bs*nframes, njoints] -> reshape to [bs, njoints, nframes]
+                geo_dist = geodesic_distance(target_quats, model_quats)  # [bs*nframes, njoints]
+                geo_dist = geo_dist.reshape(bs, nframes, njoints).permute(0, 2, 1)  # [bs, njoints, nframes]
+                
+                # Prepare mask for broadcasting: [bs, 1, 1, nframes] -> [bs, njoints, nframes]
+                mask_expanded = mask.squeeze(1).squeeze(1).unsqueeze(1).expand(bs, njoints, nframes)  # [bs, njoints, nframes]
+                
+                # Compute masked squared geodesic distance
+                masked_geo = (geo_dist ** 2) * mask_expanded.float()
+                denom = mask_expanded.float().sum() * 1.0 + 1e-8
+                terms["geo_mse"] = masked_geo.sum() / denom
 
             terms["loss"] = terms["rot_mse"] + terms.get('vb', 0.) +\
                             (self.lambda_vel * terms.get('vel_mse', 0.)) +\
