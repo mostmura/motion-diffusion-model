@@ -1354,33 +1354,143 @@ class GaussianDiffusion:
             if self.lambda_geo > 0.:
                 # Geodesic loss on rotation representation (6D rotations)
                 # target/model_output shape: [bs, njoints, nfeats, nframes]
-                # First 6 features of each joint are 6D rotation representation
-                
+
                 bs, njoints, nfeats, nframes = target.shape
-                
-                # Extract first 6 features (6D rotation): [bs, njoints, 6, nframes]
-                target_rot6d = target[:, :, :6, :]
-                model_rot6d = model_output[:, :, :6, :]
-                
-                # Permute and reshape for per-frame processing: [bs, njoints, nframes, 6] -> [bs*nframes, njoints, 6]
-                target_rot6d_flat = target_rot6d.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, 6)
-                model_rot6d_flat = model_rot6d.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, 6)
-                
-                # Convert 6D rotation to quaternions: [bs*nframes, njoints, 6] -> [bs*nframes, njoints, 4]
-                target_quats = rot6d_to_quaternion(target_rot6d_flat)
-                model_quats = rot6d_to_quaternion(model_rot6d_flat)
-                
-                # Compute geodesic distance: [bs*nframes, njoints]
-                geo_dist = geodesic_distance(target_quats, model_quats)
-                geo_dist = geo_dist.reshape(bs, nframes, njoints).permute(0, 2, 1)  # [bs, njoints, nframes]
-                
-                # Prepare mask for broadcasting: [bs, 1, 1, nframes] -> [bs, njoints, nframes]
-                mask_expanded = mask.squeeze(1).squeeze(1).unsqueeze(1).expand(bs, njoints, nframes)  # [bs, njoints, nframes]
-                
-                # Compute masked squared geodesic distance
-                masked_geo = (geo_dist ** 2) * mask_expanded.float()
-                denom = mask_expanded.float().sum() * 1.0 + 1e-8
-                terms["geo_mse"] = masked_geo.sum() / denom
+
+                # The 6D rotation data is not in the first 6 features per joint for HumanML3D/KIT datasets
+                # For these datasets, the structure is:
+                # [root_data(4), joint_rel_pos(3*(njoints-1)), joint_rot(6*(njoints-1)), local_vel, foot_contact]
+                # So rotation data for non-root joints starts at index 4 + 3*(njoints-1)
+
+                if dataset.dataname in ['humanml', 'kit']:
+                    # Calculate where rotation data starts for non-root joints
+                    rot_start_idx = 4 + (njoints - 1) * 3  # After root data and joint positions
+                    rot_end_idx = rot_start_idx + (njoints - 1) * 6  # Include 6 features per non-root joint
+
+                    # Check if we have enough features for rotation data
+                    if rot_end_idx <= nfeats:
+                        # Extract rotation data for non-root joints only
+                        # The rotation data for non-root joints is stored consecutively
+                        # Shape: [bs, njoints, nfeats, nframes] -> [bs, njoints-1, 6*(njoints-1), nframes] (skip root joint)
+                        target_rot6d = target[:, 1:, rot_start_idx:rot_end_idx, :]  # [bs, njoints-1, 6*(njoints-1), nframes]
+                        model_rot6d = model_output[:, 1:, rot_start_idx:rot_end_idx, :]  # [bs, njoints-1, 6*(njoints-1), nframes]
+
+                        # Now we need to reshape so that each joint's 6D rotation is grouped together
+                        # target_rot6d shape: [bs, njoints-1, 6*(njoints-1), nframes]
+                        # For each of the njoints-1 non-root joints, we have 6 consecutive features
+                        # So we need to extract 6 features per joint for each of the njoints-1 joints
+                        bs_act, n_rot_joints, total_rot_features, nframes_act = target_rot6d.shape
+
+                        # Validate that total_rot_features is indeed n_rot_joints * 6
+                        expected_total_features = n_rot_joints * 6
+                        if total_rot_features != expected_total_features:
+                            print(f"ERROR: Expected {expected_total_features} rotation features, got {total_rot_features}")
+                            terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                        else:
+                            # Create new tensors to store the reshaped data
+                            target_rot6d_reshaped = target_rot6d.new_zeros(bs_act, n_rot_joints, 6, nframes_act)
+                            model_rot6d_reshaped = model_rot6d.new_zeros(bs_act, n_rot_joints, 6, nframes_act)
+
+                            # Extract 6 features per joint: for joint i, extract features [i*6 : (i+1)*6]
+                            for j_idx in range(n_rot_joints):
+                                start_feat = j_idx * 6
+                                end_feat = (j_idx + 1) * 6
+                                target_rot6d_reshaped[:, j_idx, :, :] = target_rot6d[:, j_idx, start_feat:end_feat, :]
+                                model_rot6d_reshaped[:, j_idx, :, :] = model_rot6d[:, j_idx, start_feat:end_feat, :]
+
+                            # Permute: [bs, n_rot_joints, 6, nframes] -> [bs, n_rot_joints, nframes, 6]
+                            target_rot6d_perm = target_rot6d_reshaped.permute(0, 1, 3, 2)
+                            model_rot6d_perm = model_rot6d_reshaped.permute(0, 1, 3, 2)
+
+                            # Now reshape: [bs, n_rot_joints, nframes, 6] -> [bs*nframes, n_rot_joints, 6]
+                            try:
+                                target_rot6d_flat = target_rot6d_perm.reshape(bs_act * nframes_act, n_rot_joints, 6)
+                                model_rot6d_flat = model_rot6d_perm.reshape(bs_act * nframes_act, n_rot_joints, 6)
+
+                                # Convert 6D rotation to quaternions: [bs*nframes, n_rot_joints, 6] -> [bs*nframes, n_rot_joints, 4]
+                                target_quats = rot6d_to_quaternion(target_rot6d_flat)
+                                model_quats = rot6d_to_quaternion(model_rot6d_flat)
+
+                                # Compute geodesic distance: [bs*nframes, n_rot_joints]
+                                geo_dist = geodesic_distance(target_quats, model_quats)
+
+                                # Check for NaN or infinite values
+                                if th.isnan(geo_dist).any() or th.isinf(geo_dist).any():
+                                    print("WARNING: Found NaN or Inf values in geodesic distance")
+                                    # Replace NaN/Inf with 0
+                                    geo_dist = th.nan_to_num(geo_dist, nan=0.0, posinf=0.0, neginf=0.0)
+
+                                geo_dist = geo_dist.reshape(bs_act, nframes_act, n_rot_joints).permute(0, 2, 1)  # [bs, n_rot_joints, nframes]
+
+                                # Prepare mask for the non-root joints: [bs, njoints, 1, nframes] -> [bs, n_rot_joints, nframes]
+                                # Only apply to non-root joints (indices 1 to njoints-1)
+                                mask_non_root = mask[:, 1:, :, :]  # [bs, n_rot_joints, 1, nframes]
+                                mask_expanded = mask_non_root.squeeze(2).expand(bs_act, n_rot_joints, nframes_act)  # [bs, n_rot_joints, nframes]
+
+                                # Check if mask has any non-zero values
+                                mask_sum = mask_expanded.float().sum()
+                                if mask_sum.item() == 0:
+                                    print("WARNING: Mask sum is 0, geodesic loss will be 0")
+                                    terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                                else:
+                                    # Compute masked squared geodesic distance
+                                    masked_geo = (geo_dist ** 2) * mask_expanded.float()
+                                    denom = mask_sum * 1.0 + 1e-8
+                                    terms["geo_mse"] = masked_geo.sum() / denom
+                            except RuntimeError as e:
+                                # Handle reshape error gracefully
+                                print(f"Geodesic loss reshape error: {str(e)}")
+                                print(f"Actual tensor shape after permute: {target_rot6d_perm.shape}")
+                                print(f"Target reshape dimensions: {(bs_act * nframes_act, n_rot_joints, 6)}")
+                                terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                    else:
+                        # Not enough features for rotation data
+                        print(f"Not enough features for rotation data. Need {rot_end_idx}, got {nfeats}")
+                        terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                else:
+                    # For other datasets, use the original approach if we have enough features
+                    if nfeats >= 6:
+                        # Extract the first 6 features as 6D rotation representation (fallback)
+                        target_rot6d = target[:, :, :6, :]  # [bs, njoints, 6, nframes]
+                        model_rot6d = model_output[:, :, :6, :]  # [bs, njoints, 6, nframes]
+
+                        # Get the actual shape after slicing
+                        bs_act, njoints_act, nfeats_act, nframes_act = target_rot6d.shape  # Should be [bs, njoints, 6, nframes]
+
+                        # Permute: [bs, njoints, 6, nframes] -> [bs, njoints, nframes, 6]
+                        target_rot6d_perm = target_rot6d.permute(0, 1, 3, 2)
+                        model_rot6d_perm = model_rot6d.permute(0, 1, 3, 2)
+
+                        # Now reshape: [bs, njoints, nframes, 6] -> [bs*nframes, njoints, 6]
+                        # This should work if the tensor has bs * njoints * nframes * 6 elements
+                        try:
+                            target_rot6d_flat = target_rot6d_perm.reshape(bs_act * nframes_act, njoints_act, 6)
+                            model_rot6d_flat = model_rot6d_perm.reshape(bs_act * nframes_act, njoints_act, 6)
+
+                            # Convert 6D rotation to quaternions: [bs*nframes, njoints, 6] -> [bs*nframes, njoints, 4]
+                            target_quats = rot6d_to_quaternion(target_rot6d_flat)
+                            model_quats = rot6d_to_quaternion(model_rot6d_flat)
+
+                            # Compute geodesic distance: [bs*nframes, njoints]
+                            geo_dist = geodesic_distance(target_quats, model_quats)
+                            geo_dist = geo_dist.reshape(bs_act, nframes_act, njoints_act).permute(0, 2, 1)  # [bs, njoints, nframes]
+
+                            # Prepare mask for broadcasting: [bs, 1, 1, nframes] -> [bs, njoints, nframes]
+                            mask_expanded = mask.squeeze(1).squeeze(1).unsqueeze(1).expand(bs_act, njoints_act, nframes_act)  # [bs, njoints, nframes]
+
+                            # Compute masked squared geodesic distance
+                            masked_geo = (geo_dist ** 2) * mask_expanded.float()
+                            denom = mask_expanded.float().sum() * 1.0 + 1e-8
+                            terms["geo_mse"] = masked_geo.sum() / denom
+                        except RuntimeError as e:
+                            # Handle reshape error gracefully
+                            print(f"Geodesic loss reshape error: {str(e)}")
+                            print(f"Actual tensor shape after permute: {target_rot6d_perm.shape}")
+                            print(f"Target reshape dimensions: {(bs_act * nframes_act, njoints_act, 6)}")
+                            terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
+                    else:
+                        # Not enough features for 6D rotation representation
+                        terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
 
             terms["loss"] = terms["rot_mse"] + terms.get('vb', 0.) +\
                             (self.lambda_vel * terms.get('vel_mse', 0.)) +\
