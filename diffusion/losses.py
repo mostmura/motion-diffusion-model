@@ -209,13 +209,14 @@ def qmul(q, r):
     q_flat = q.reshape(-1, 4)  # [batch_product, 4]
     r_flat = r.reshape(-1, 4)  # [batch_product, 4]
 
-    # Compute outer product via bmm
-    terms = th.bmm(r_flat.unsqueeze(1), q_flat.unsqueeze(2))  # [batch_product, 4, 4]
+    # Direct quaternion multiplication formula
+    w1, x1, y1, z1 = q_flat[:, 0], q_flat[:, 1], q_flat[:, 2], q_flat[:, 3]
+    w2, x2, y2, z2 = r_flat[:, 0], r_flat[:, 1], r_flat[:, 2], r_flat[:, 3]
 
-    w = terms[:, 0, 0] - terms[:, 1, 1] - terms[:, 2, 2] - terms[:, 3, 3]
-    x = terms[:, 0, 1] + terms[:, 1, 0] - terms[:, 2, 3] + terms[:, 3, 2]
-    y = terms[:, 0, 2] + terms[:, 1, 3] + terms[:, 2, 0] - terms[:, 3, 1]
-    z = terms[:, 0, 3] - terms[:, 1, 2] + terms[:, 2, 1] + terms[:, 3, 0]
-    
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
     result = th.stack((w, x, y, z), dim=1)  # [batch_product, 4]
     return result.view(original_shape)

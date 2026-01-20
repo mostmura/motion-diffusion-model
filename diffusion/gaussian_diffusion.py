@@ -19,7 +19,7 @@ from data_loaders.humanml.scripts import motion_process
 from utils.loss_util import masked_l2, masked_goal_l2
 from data_loaders.humanml.scripts.motion_process import get_target_location
 
-from diffusion.losses import rot6d_to_quaternion
+from diffusion.losses import rot6d_to_quaternion, geodesic_distance
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
