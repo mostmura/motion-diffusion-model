@@ -1353,21 +1353,14 @@ class GaussianDiffusion:
                             
             if self.lambda_geo > 0.:
                 # Geodesic loss on rotation representation (6D rotations)
-                # target/model_output shape: [bs, total_features=263/251, nframes]
-                # HumanML3D has 22 joints, KIT has 21 joints
-                # First njoints*6 features are 6D rotation representations
+                # target/model_output shape: [bs, njoints, nfeats, nframes]
+                # First 6 features of each joint are 6D rotation representation
                 
-                bs, total_features, nframes = target.shape
-                njoints = 22 if total_features == 263 else 21  # 263 for HumanML3D, 251 for KIT
-                n_rot_features = njoints * 6  # Total 6D rotation features
+                bs, njoints, nfeats, nframes = target.shape
                 
-                # Extract first n_rot_features from flattened representation: [bs, n_rot_features, nframes]
-                target_rot_flat = target[:, :n_rot_features, :]
-                model_rot_flat = model_output[:, :n_rot_features, :]
-                
-                # Reshape to separate joints: [bs, njoints, 6, nframes]
-                target_rot6d = target_rot_flat.reshape(bs, njoints, 6, nframes)
-                model_rot6d = model_rot_flat.reshape(bs, njoints, 6, nframes)
+                # Extract first 6 features (6D rotation): [bs, njoints, 6, nframes]
+                target_rot6d = target[:, :, :6, :]
+                model_rot6d = model_output[:, :, :6, :]
                 
                 # Permute and reshape for per-frame processing: [bs, njoints, nframes, 6] -> [bs*nframes, njoints, 6]
                 target_rot6d_flat = target_rot6d.permute(0, 1, 3, 2).reshape(bs * nframes, njoints, 6)
