@@ -82,6 +82,10 @@ def geodesic_distance(q1, q2):
     Compute geodesic distance between two quaternions on SO(3).
     q1, q2: tensors of shape (batch_size, num_joints, 4)
     Returns: tensor of shape (batch_size, num_joints) with geodesic distances
+
+    Uses atan2 formulation for numerical stability. The naive acos formulation
+    has gradient -1/sqrt(1-x^2) which goes to infinity as x->1, causing NaN
+    gradients when quaternions are nearly identical.
     """
     # Normalize quaternions
     q1 = qnormalize(q1)
@@ -90,14 +94,18 @@ def geodesic_distance(q1, q2):
     # Compute relative quaternion: q1 * qinv(q2)
     q_rel = qmul(q1, qinv(q2))
 
-    # Extract scalar part (w component)
+    # Extract scalar (w) and vector (xyz) parts
     w = q_rel[..., 0]
+    xyz = q_rel[..., 1:4]
 
-    # Geodesic distance = 2 * arccos(|w|)
-    # Clamp w to [-1, 1] for numerical stability
-    w = th.clamp(w, -1.0, 1.0)
-    # Use torch.arccos for PyTorch compatibility
-    return 2 * th.acos(th.abs(w))
+    # Compute the norm of the vector part
+    # Add small epsilon inside sqrt to prevent zero gradient when xyz is zero
+    xyz_norm = th.sqrt((xyz * xyz).sum(dim=-1) + 1e-10)
+
+    # Geodesic distance = 2 * atan2(||xyz||, |w|)
+    # atan2 is numerically stable everywhere - no infinite gradients
+    # We use abs(w) to handle the quaternion double-cover (q and -q represent same rotation)
+    return 2 * th.atan2(xyz_norm, th.abs(w))
 
 
 def rot6d_to_quaternion(rot6d):
@@ -110,12 +118,16 @@ def rot6d_to_quaternion(rot6d):
     x_raw = rot6d[..., 0:3]
     y_raw = rot6d[..., 3:6]
     
-    # Normalize x
-    x = x_raw / th.norm(x_raw, dim=-1, keepdim=True)
-    
+    # Numerical eps for stability
+    EPS = 1e-8
+
+    # Normalize x (add small eps to avoid division by zero)
+    x = x_raw / (th.norm(x_raw, dim=-1, keepdim=True) + EPS)
+
     # Orthogonalize y with respect to x
     y = y_raw - th.sum(y_raw * x, dim=-1, keepdim=True) * x
-    y = y / th.norm(y, dim=-1, keepdim=True)
+    # Normalize y (add small eps)
+    y = y / (th.norm(y, dim=-1, keepdim=True) + EPS)
     
     # Compute z as cross product of x and y
     z = th.cross(x, y, dim=-1)
@@ -135,34 +147,38 @@ def rot6d_to_quaternion(rot6d):
     
     # Case 1: trace > 0
     mask1 = trace > 0
-    s1 = 0.5 / th.sqrt(trace[mask1] + 1.0)
-    q[mask1, 0] = 0.25 / s1
+    s1 = 0.5 / th.sqrt((trace[mask1] + 1.0).clamp(min=EPS))
+    s1_safe = s1 + EPS
+    q[mask1, 0] = 0.25 / s1_safe
     q[mask1, 1] = (mat_flat[mask1, 2, 1] - mat_flat[mask1, 1, 2]) * s1
     q[mask1, 2] = (mat_flat[mask1, 0, 2] - mat_flat[mask1, 2, 0]) * s1
     q[mask1, 3] = (mat_flat[mask1, 1, 0] - mat_flat[mask1, 0, 1]) * s1
     
     # Case 2: trace <= 0 (trace is smallest)
     mask2 = (trace <= 0) & (mat_flat[:, 0, 0] >= mat_flat[:, 1, 1]) & (mat_flat[:, 0, 0] >= mat_flat[:, 2, 2])
-    s2 = 2.0 * th.sqrt(1.0 + mat_flat[mask2, 0, 0] - mat_flat[mask2, 1, 1] - mat_flat[mask2, 2, 2])
-    q[mask2, 0] = (mat_flat[mask2, 2, 1] - mat_flat[mask2, 1, 2]) / s2
+    s2 = 2.0 * th.sqrt((1.0 + mat_flat[mask2, 0, 0] - mat_flat[mask2, 1, 1] - mat_flat[mask2, 2, 2]).clamp(min=EPS))
+    s2_safe = s2 + EPS
+    q[mask2, 0] = (mat_flat[mask2, 2, 1] - mat_flat[mask2, 1, 2]) / s2_safe
     q[mask2, 1] = 0.25 * s2
-    q[mask2, 2] = (mat_flat[mask2, 0, 1] + mat_flat[mask2, 1, 0]) / s2
-    q[mask2, 3] = (mat_flat[mask2, 0, 2] + mat_flat[mask2, 2, 0]) / s2
+    q[mask2, 2] = (mat_flat[mask2, 0, 1] + mat_flat[mask2, 1, 0]) / s2_safe
+    q[mask2, 3] = (mat_flat[mask2, 0, 2] + mat_flat[mask2, 2, 0]) / s2_safe
     
     # Case 3: m[1,1] is largest
     mask3 = (trace <= 0) & (mat_flat[:, 1, 1] >= mat_flat[:, 2, 2]) & ~mask2
-    s3 = 2.0 * th.sqrt(1.0 + mat_flat[mask3, 1, 1] - mat_flat[mask3, 0, 0] - mat_flat[mask3, 2, 2])
-    q[mask3, 0] = (mat_flat[mask3, 0, 2] - mat_flat[mask3, 2, 0]) / s3
-    q[mask3, 1] = (mat_flat[mask3, 0, 1] + mat_flat[mask3, 1, 0]) / s3
+    s3 = 2.0 * th.sqrt((1.0 + mat_flat[mask3, 1, 1] - mat_flat[mask3, 0, 0] - mat_flat[mask3, 2, 2]).clamp(min=EPS))
+    s3_safe = s3 + EPS
+    q[mask3, 0] = (mat_flat[mask3, 0, 2] - mat_flat[mask3, 2, 0]) / s3_safe
+    q[mask3, 1] = (mat_flat[mask3, 0, 1] + mat_flat[mask3, 1, 0]) / s3_safe
     q[mask3, 2] = 0.25 * s3
-    q[mask3, 3] = (mat_flat[mask3, 1, 2] + mat_flat[mask3, 2, 1]) / s3
+    q[mask3, 3] = (mat_flat[mask3, 1, 2] + mat_flat[mask3, 2, 1]) / s3_safe
     
     # Case 4: m[2,2] is largest
     mask4 = (trace <= 0) & ~mask2 & ~mask3
-    s4 = 2.0 * th.sqrt(1.0 + mat_flat[mask4, 2, 2] - mat_flat[mask4, 0, 0] - mat_flat[mask4, 1, 1])
-    q[mask4, 0] = (mat_flat[mask4, 1, 0] - mat_flat[mask4, 0, 1]) / s4
-    q[mask4, 1] = (mat_flat[mask4, 0, 2] + mat_flat[mask4, 2, 0]) / s4
-    q[mask4, 2] = (mat_flat[mask4, 1, 2] + mat_flat[mask4, 2, 1]) / s4
+    s4 = 2.0 * th.sqrt((1.0 + mat_flat[mask4, 2, 2] - mat_flat[mask4, 0, 0] - mat_flat[mask4, 1, 1]).clamp(min=EPS))
+    s4_safe = s4 + EPS
+    q[mask4, 0] = (mat_flat[mask4, 1, 0] - mat_flat[mask4, 0, 1]) / s4_safe
+    q[mask4, 1] = (mat_flat[mask4, 0, 2] + mat_flat[mask4, 2, 0]) / s4_safe
+    q[mask4, 2] = (mat_flat[mask4, 1, 2] + mat_flat[mask4, 2, 1]) / s4_safe
     q[mask4, 3] = 0.25 * s4
     
     # Reshape back to original batch shape
