@@ -1354,7 +1354,9 @@ class GaussianDiffusion:
             if self.lambda_geo > 0.:
                 # SNR weighting: reduce geodesic loss contribution at high noise timesteps
                 # SNR = alpha_cumprod / (1 - alpha_cumprod), higher at low noise (small t)
-                snr = self.alphas_cumprod[t] / (1.0 - self.alphas_cumprod[t] + 1e-8)
+                # Convert alphas_cumprod to tensor on same device as t
+                alphas_cumprod_t = th.tensor(self.alphas_cumprod, device=t.device, dtype=th.float32)[t]
+                snr = alphas_cumprod_t / (1.0 - alphas_cumprod_t + 1e-8)
                 # Normalize SNR weight to [0, 1] range and clamp to avoid explosion
                 snr_weight = (snr / (snr + 1.0)).clamp(min=0.0, max=1.0)  # Sigmoid-like scaling
                 # Average across batch for a single scalar weight
