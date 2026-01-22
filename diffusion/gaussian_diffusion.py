@@ -1355,7 +1355,7 @@ class GaussianDiffusion:
 
                 bs, njoints, nfeats, nframes = target.shape
                 # DEBUG: Print dataset info to understand what's happening
-                print(f"DEBUG: Geodesic loss - dataset.dataname={dataset.dataname}, nfeats={nfeats}, njoints={njoints}, lambda_geo={self.lambda_geo}")
+                # print(f"DEBUG: Geodesic loss - dataset.dataname={dataset.dataname}, nfeats={nfeats}, njoints={njoints}, lambda_geo={self.lambda_geo}")
 
                 # Check if target or model_output contain NaN/Inf values
                 if th.isnan(target).any() or th.isinf(target).any():
@@ -1424,10 +1424,10 @@ class GaussianDiffusion:
                                 # print("DEBUG: One or both rotation tensors contain NaN or Inf values!")
                                 terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
                             else:
-                                print("DEBUG: Starting geodesic computation after tensor validation")
+                                # print("DEBUG: Starting geodesic computation after tensor validation")
                                 # Wrap the entire geodesic computation in a try-catch to prevent training collapse
                                 try:
-                                    print("DEBUG: Inside main geodesic computation try block")
+                                    # print("DEBUG: Inside main geodesic computation try block")
                                     # Reshape rotation data: [bs, 6*(actual_joints_num-1), nfeats, nframes] -> [bs, actual_joints_num-1, 6, nframes]
                                     # This groups every 6 consecutive features as belonging to one joint
                                     # First, reshape [bs, total_rot_features, nfeats, nframes] to [bs, n_rot_joints, 6, nfeats, nframes]
@@ -1452,7 +1452,7 @@ class GaussianDiffusion:
                                     # print(f"DEBUG: Successfully reshaped model_rot6d_flat to {model_rot6d_flat.shape}")
 
                                     # Convert 6D rotation to quaternions: [bs*nframes, n_rot_joints, 6] -> [bs*nframes, n_rot_joints, 4]
-                                    print(f"DEBUG: Converting 6D rotations to quaternions...")
+                                    # print(f"DEBUG: Converting 6D rotations to quaternions...")
 
                                     # Check input values before conversion
                                     if th.isnan(target_rot6d_flat).any() or th.isinf(target_rot6d_flat).any():
@@ -1464,7 +1464,7 @@ class GaussianDiffusion:
 
                                     target_quats = rot6d_to_quaternion(target_rot6d_flat)
                                     model_quats = rot6d_to_quaternion(model_rot6d_flat)
-                                    print(f"DEBUG: Conversion successful. Quat shapes: target={target_quats.shape}, model={model_quats.shape}")
+                                    # print(f"DEBUG: Conversion successful. Quat shapes: target={target_quats.shape}, model={model_quats.shape}")
 
                                     # Check if quaternions contain NaN/Inf
                                     if th.isnan(target_quats).any() or th.isinf(target_quats).any():
@@ -1475,24 +1475,24 @@ class GaussianDiffusion:
                                         print(f"Model quats stats - min: {model_quats.min()}, max: {model_quats.max()}, mean: {model_quats.mean()}")
 
                                     # Compute geodesic distance: [bs*nframes, n_rot_joints]
-                                    print(f"DEBUG: Computing geodesic distance...")
+                                    # print(f"DEBUG: Computing geodesic distance...")
                                     geo_dist = geodesic_distance(target_quats, model_quats)
-                                    print(f"DEBUG: Geodesic distance computed. Shape: {geo_dist.shape}")
+                                    # print(f"DEBUG: Geodesic distance computed. Shape: {geo_dist.shape}")
 
                                     # Check geodesic distance for NaN/Inf
                                     if th.isnan(geo_dist).any() or th.isinf(geo_dist).any():
                                         print("WARNING: Geodesic distance contains NaN or Inf values!")
                                         print(f"Geo dist stats - min: {geo_dist.min()}, max: {geo_dist.max()}, mean: {geo_dist.mean()}")
-                                    else:
-                                        print(f"DEBUG: Geodesic distance stats - min: {geo_dist.min()}, max: {geo_dist.max()}, mean: {geo_dist.mean()}")
+                                    # else:
+                                    #     print(f"DEBUG: Geodesic distance stats - min: {geo_dist.min()}, max: {geo_dist.max()}, mean: {geo_dist.mean()}")
 
                                     # Check for NaN or infinite values
                                     if th.isnan(geo_dist).any() or th.isinf(geo_dist).any():
                                         print("WARNING: Found NaN or Inf values in geodesic distance")
                                         # Replace NaN/Inf with 0
                                         geo_dist = th.nan_to_num(geo_dist, nan=0.0, posinf=0.0, neginf=0.0)
-                                    else:
-                                        print(f"DEBUG: Geodesic distance range: [{geo_dist.min():.4f}, {geo_dist.max():.4f}], mean: {geo_dist.mean():.4f}")
+                                    # else:
+                                    #     print(f"DEBUG: Geodesic distance range: [{geo_dist.min():.4f}, {geo_dist.max():.4f}], mean: {geo_dist.mean():.4f}")
 
                                     geo_dist = geo_dist.reshape(bs_act, nframes_act, n_rot_joints).permute(0, 2, 1)  # [bs, n_rot_joints, nframes]
                                     # print(f"DEBUG: Reshaped geo_dist to {geo_dist.shape}")
@@ -1522,7 +1522,7 @@ class GaussianDiffusion:
                                     else:
                                         # Compute masked squared geodesic distance
                                         geo_dist_squared = geo_dist ** 2
-                                        print(f"DEBUG: Squared geodesic distance stats - min: {geo_dist_squared.min():.4f}, max: {geo_dist_squared.max():.4f}, mean: {geo_dist_squared.mean():.4f}")
+                                        # print(f"DEBUG: Squared geodesic distance stats - min: {geo_dist_squared.min():.4f}, max: {geo_dist_squared.max():.4f}, mean: {geo_dist_squared.mean():.4f}")
 
                                         # Check for NaN/Inf in squared distances
                                         if th.isnan(geo_dist_squared).any() or th.isinf(geo_dist_squared).any():
@@ -1530,7 +1530,7 @@ class GaussianDiffusion:
                                             terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
                                         else:
                                             masked_geo = geo_dist_squared * mask_expanded.float()
-                                            print(f"DEBUG: Masked geo stats - min: {masked_geo.min():.4f}, max: {masked_geo.max():.4f}, mean: {masked_geo.mean():.4f}")
+                                            # print(f"DEBUG: Masked geo stats - min: {masked_geo.min():.4f}, max: {masked_geo.max():.4f}, mean: {masked_geo.mean():.4f}")
 
                                             # Check for NaN/Inf in masked_geo
                                             if th.isnan(masked_geo).any() or th.isinf(masked_geo).any():
@@ -1541,7 +1541,7 @@ class GaussianDiffusion:
                                                 masked_geo = th.clamp(masked_geo, max=1e4)  # Prevent extremely large values
                                                 denom = mask_sum * 1.0 + 1e-8
                                                 terms["geo_mse"] = masked_geo.sum() / denom
-                                                print(f"DEBUG: Final geo_mse value: {terms['geo_mse']:.4f}")
+                                                # print(f"DEBUG: Final geo_mse value: {terms['geo_mse']:.4f}")
 
                                                 # Final check: if the result is still NaN or Inf, set to 0
                                                 if th.isnan(terms["geo_mse"]) or th.isinf(terms["geo_mse"]):
