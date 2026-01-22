@@ -1351,11 +1351,16 @@ class GaussianDiffusion:
                                             model_kwargs['y']['target_joint_names'], model_kwargs['y']['is_heading'])
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
                             
-            if self.lambda_geo > 0.:
+            # Only apply geodesic loss at low noise timesteps (t < 30% of num_timesteps)
+            # At high noise levels, rotation predictions are inaccurate and geodesic loss adds noise to gradients
+            geo_timestep_threshold = int(self.num_timesteps * 0.3)  # e.g., 15 for 50 steps
+            apply_geo_loss = self.lambda_geo > 0. and (t.float().mean() < geo_timestep_threshold)
+
+            if apply_geo_loss:
 
                 bs, njoints, nfeats, nframes = target.shape
                 # DEBUG: Print dataset info to understand what's happening
-                # print(f"DEBUG: Geodesic loss - dataset.dataname={dataset.dataname}, nfeats={nfeats}, njoints={njoints}, lambda_geo={self.lambda_geo}")
+                # print(f"DEBUG: Geodesic loss - t_mean={t.float().mean():.1f}, threshold={geo_timestep_threshold}, applying geo loss")
 
                 # Check if target or model_output contain NaN/Inf values
                 if th.isnan(target).any() or th.isinf(target).any():
