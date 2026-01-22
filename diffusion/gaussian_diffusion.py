@@ -1351,16 +1351,18 @@ class GaussianDiffusion:
                                             model_kwargs['y']['target_joint_names'], model_kwargs['y']['is_heading'])
                 terms["target_loc"] = masked_goal_l2(pred_target, ref_target, model_kwargs['y'], model.all_goal_joint_names)
                             
-            # Only apply geodesic loss at low noise timesteps (t < 30% of num_timesteps)
-            # At high noise levels, rotation predictions are inaccurate and geodesic loss adds noise to gradients
-            geo_timestep_threshold = int(self.num_timesteps * 0.3)  # e.g., 15 for 50 steps
-            apply_geo_loss = self.lambda_geo > 0. and (t.float().mean() < geo_timestep_threshold)
-
-            if apply_geo_loss:
+            if self.lambda_geo > 0.:
+                # SNR weighting: reduce geodesic loss contribution at high noise timesteps
+                # SNR = alpha_cumprod / (1 - alpha_cumprod), higher at low noise (small t)
+                snr = self.alphas_cumprod[t] / (1.0 - self.alphas_cumprod[t] + 1e-8)
+                # Normalize SNR weight to [0, 1] range and clamp to avoid explosion
+                snr_weight = (snr / (snr + 1.0)).clamp(min=0.0, max=1.0)  # Sigmoid-like scaling
+                # Average across batch for a single scalar weight
+                geo_snr_weight = snr_weight.mean()
 
                 bs, njoints, nfeats, nframes = target.shape
-                # DEBUG: Print dataset info to understand what's happening
-                # print(f"DEBUG: Geodesic loss - t_mean={t.float().mean():.1f}, threshold={geo_timestep_threshold}, applying geo loss")
+                # DEBUG: Print SNR weight info
+                # print(f"DEBUG: Geodesic loss - t_mean={t.float().mean():.1f}, snr_weight={geo_snr_weight:.4f}")
 
                 # Check if target or model_output contain NaN/Inf values
                 if th.isnan(target).any() or th.isinf(target).any():
@@ -1610,12 +1612,18 @@ class GaussianDiffusion:
                         print(f"DEBUG: Not enough features for 6D rotation representation (nfeats={nfeats} < 6), setting geo_mse to 0.0")
                         terms["geo_mse"] = th.tensor(0.0, device=target.device, dtype=target.dtype)
 
+            # Apply SNR weight to geodesic loss if it was computed
+            geo_loss_contribution = 0.
+            if self.lambda_geo > 0. and 'geo_mse' in terms:
+                geo_loss_contribution = self.lambda_geo * geo_snr_weight * terms['geo_mse']
+                terms["geo_mse_weighted"] = geo_snr_weight * terms['geo_mse']  # For logging
+
             terms["loss"] = terms["rot_mse"] + terms.get('vb', 0.) +\
                             (self.lambda_vel * terms.get('vel_mse', 0.)) +\
                             (self.lambda_rcxyz * terms.get('rcxyz_mse', 0.)) + \
                             (self.lambda_target_loc * terms.get('target_loc', 0.)) + \
                             (self.lambda_fc * terms.get('fc', 0.)) + \
-                            (self.lambda_geo * terms.get('geo_mse', 0.))
+                            geo_loss_contribution
 
         else:
             raise NotImplementedError(self.loss_type)
