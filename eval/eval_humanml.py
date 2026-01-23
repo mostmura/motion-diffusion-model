@@ -271,6 +271,10 @@ def evaluate_geodesic(gt_loader, gen_loader, file, num_joints=22):
     - Rotation data ends at index 67 + (22-1)*6 = 193
     - Each joint has 6D rotation representation
 
+    IMPORTANT: The motions in eval mode are normalized using T2M conventions.
+    We must denormalize them before computing geodesic distance, because
+    normalized values are NOT valid 6D rotations.
+
     Returns:
         dict with 'mean_geodesic', 'std_geodesic', 'median_geodesic'
     """
@@ -282,6 +286,45 @@ def evaluate_geodesic(gt_loader, gen_loader, file, num_joints=22):
     rot_end_idx = rot_start_idx + (num_joints - 1) * 6  # 193 for 22 joints
     n_rot_joints = num_joints - 1  # 21 non-root joints
 
+    # Get normalization stats from the dataset to denormalize
+    # The loaders use T2M eval normalization
+    # Note: gt_loader.dataset has mean_for_eval directly
+    #       gen_loader.dataset is CompMDMGeneratedDataset which has .dataset.mean_for_eval
+    try:
+        gt_dataset = gt_loader.dataset
+        gen_dataset = gen_loader.dataset
+
+        # Try to get mean/std from gt_dataset first
+        mean_eval = None
+        std_eval = None
+
+        # Check gt_dataset directly
+        if hasattr(gt_dataset, 'mean_for_eval') and hasattr(gt_dataset, 'std_for_eval'):
+            mean_eval = np.array(gt_dataset.mean_for_eval)
+            std_eval = np.array(gt_dataset.std_for_eval)
+        # Check if it's nested (for generated dataset)
+        elif hasattr(gt_dataset, 'dataset') and hasattr(gt_dataset.dataset, 'mean_for_eval'):
+            mean_eval = np.array(gt_dataset.dataset.mean_for_eval)
+            std_eval = np.array(gt_dataset.dataset.std_for_eval)
+        # Fallback to mean/std
+        elif hasattr(gt_dataset, 'mean') and hasattr(gt_dataset, 'std'):
+            mean_eval = np.array(gt_dataset.mean)
+            std_eval = np.array(gt_dataset.std)
+
+        if mean_eval is not None:
+            mean_eval = torch.tensor(mean_eval, dtype=torch.float32)
+            std_eval = torch.tensor(std_eval, dtype=torch.float32)
+            print(f'Geodesic eval: Using normalization stats with shape {mean_eval.shape}')
+        else:
+            print('Warning: Could not find normalization stats, results may be incorrect')
+            print('Warning: Could not find normalization stats, results may be incorrect', file=file, flush=True)
+
+    except Exception as e:
+        print(f'Warning: Error getting normalization stats: {e}')
+        print(f'Warning: Error getting normalization stats: {e}', file=file, flush=True)
+        mean_eval = None
+        std_eval = None
+
     all_geodesic_distances = []
 
     with torch.no_grad():
@@ -290,6 +333,17 @@ def evaluate_geodesic(gt_loader, gen_loader, file, num_joints=22):
             # Unpack batches
             _, _, _, _, gt_motions, gt_m_lens, _ = gt_batch
             _, _, _, _, gen_motions, gen_m_lens, _ = gen_batch
+
+            # Denormalize motions to get valid 6D rotations
+            if mean_eval is not None and std_eval is not None:
+                # Move stats to same device as motions
+                device = gt_motions.device
+                mean_eval_dev = mean_eval.to(device)
+                std_eval_dev = std_eval.to(device)
+
+                # Denormalize: original = normalized * std + mean
+                gt_motions = gt_motions * std_eval_dev + mean_eval_dev
+                gen_motions = gen_motions * std_eval_dev + mean_eval_dev
 
             batch_size = gt_motions.shape[0]
 
