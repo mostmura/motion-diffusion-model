@@ -15,6 +15,9 @@ from data_loaders.get_data import get_dataset_loader
 from utils.sampler_util import ClassifierFreeSampleModel
 from train.train_platforms import ClearmlPlatform, TensorboardPlatform, NoPlatform, WandBPlatform  # required for the eval operation
 
+# Import geodesic distance functions for rotation quality evaluation
+from diffusion.losses import geodesic_distance, rot6d_to_quaternion
+
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 def evaluate_matching_score(eval_wrapper, motion_loaders, file, num_samples_limit=None):
@@ -259,6 +262,94 @@ def evaluate_multimodality(eval_wrapper, mm_motion_loaders, file, mm_num_times):
     return eval_dict
 
 
+def evaluate_geodesic(gt_loader, gen_loader, file, num_joints=22):
+    """
+    Evaluate geodesic distance between ground truth and generated rotations.
+
+    For HumanML3D with 22 joints:
+    - Rotation data starts at index 4 + (22-1)*3 = 67
+    - Rotation data ends at index 67 + (22-1)*6 = 193
+    - Each joint has 6D rotation representation
+
+    Returns:
+        dict with 'mean_geodesic', 'std_geodesic', 'median_geodesic'
+    """
+    print('========== Evaluating Geodesic Distance ==========')
+    print('========== Evaluating Geodesic Distance ==========', file=file, flush=True)
+
+    # Rotation indices for HumanML3D format
+    rot_start_idx = 4 + (num_joints - 1) * 3  # 67 for 22 joints
+    rot_end_idx = rot_start_idx + (num_joints - 1) * 6  # 193 for 22 joints
+    n_rot_joints = num_joints - 1  # 21 non-root joints
+
+    all_geodesic_distances = []
+
+    with torch.no_grad():
+        # Iterate through both loaders in parallel
+        for (gt_batch, gen_batch) in zip(gt_loader, gen_loader):
+            # Unpack batches
+            _, _, _, _, gt_motions, gt_m_lens, _ = gt_batch
+            _, _, _, _, gen_motions, gen_m_lens, _ = gen_batch
+
+            batch_size = gt_motions.shape[0]
+
+            for i in range(batch_size):
+                # Get valid length (minimum of both to ensure fair comparison)
+                gt_len = int(gt_m_lens[i].item()) if torch.is_tensor(gt_m_lens[i]) else int(gt_m_lens[i])
+                gen_len = int(gen_m_lens[i].item()) if torch.is_tensor(gen_m_lens[i]) else int(gen_m_lens[i])
+                valid_len = min(gt_len, gen_len)
+
+                if valid_len <= 0:
+                    continue
+
+                # Extract rotation data: [seq_len, 263] -> [valid_len, 126]
+                gt_rot = gt_motions[i, :valid_len, rot_start_idx:rot_end_idx]  # [valid_len, 126]
+                gen_rot = gen_motions[i, :valid_len, rot_start_idx:rot_end_idx]  # [valid_len, 126]
+
+                # Check for NaN/Inf
+                if torch.isnan(gt_rot).any() or torch.isnan(gen_rot).any():
+                    continue
+                if torch.isinf(gt_rot).any() or torch.isinf(gen_rot).any():
+                    continue
+
+                # Reshape to [valid_len, n_rot_joints, 6]
+                gt_rot = gt_rot.reshape(valid_len, n_rot_joints, 6)
+                gen_rot = gen_rot.reshape(valid_len, n_rot_joints, 6)
+
+                # Convert to quaternions: [valid_len, n_rot_joints, 4]
+                gt_quats = rot6d_to_quaternion(gt_rot)
+                gen_quats = rot6d_to_quaternion(gen_rot)
+
+                # Compute geodesic distance: [valid_len, n_rot_joints]
+                geo_dist = geodesic_distance(gt_quats, gen_quats)
+
+                # Check for NaN in result
+                if torch.isnan(geo_dist).any():
+                    continue
+
+                # Convert to degrees and store mean per frame
+                geo_dist_degrees = torch.rad2deg(geo_dist)  # Convert radians to degrees
+                mean_geo_per_frame = geo_dist_degrees.mean(dim=1)  # Mean across joints per frame
+                all_geodesic_distances.append(mean_geo_per_frame.cpu().numpy())
+
+    if len(all_geodesic_distances) == 0:
+        print('Warning: No valid geodesic distances computed')
+        print('Warning: No valid geodesic distances computed', file=file, flush=True)
+        return {'mean': float('nan'), 'std': float('nan'), 'median': float('nan')}
+
+    # Concatenate all distances
+    all_distances = np.concatenate(all_geodesic_distances)
+
+    mean_geo = np.mean(all_distances)
+    std_geo = np.std(all_distances)
+    median_geo = np.median(all_distances)
+
+    print(f'---> Geodesic Distance (degrees): Mean: {mean_geo:.4f}, Std: {std_geo:.4f}, Median: {median_geo:.4f}')
+    print(f'---> Geodesic Distance (degrees): Mean: {mean_geo:.4f}, Std: {std_geo:.4f}, Median: {median_geo:.4f}', file=file, flush=True)
+
+    return {'mean': mean_geo, 'std': std_geo, 'median': median_geo}
+
+
 def get_metric_statistics(values, replication_times):
     mean = np.mean(values, axis=0)
     std = np.std(values, axis=0)
@@ -266,14 +357,16 @@ def get_metric_statistics(values, replication_times):
     return mean, conf_interval
 
 
-def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times, 
-               diversity_times, mm_num_times, run_mm=False, eval_platform=None, num_samples_limit=None):
+def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replication_times,
+               diversity_times, mm_num_times, run_mm=False, eval_platform=None, num_samples_limit=None,
+               run_geodesic=True):
     with open(log_file, 'w') as f:
         all_metrics = OrderedDict({'Matching Score': OrderedDict({}),
                                    'R_precision': OrderedDict({}),
                                    'FID': OrderedDict({}),
                                    'Diversity': OrderedDict({}),
-                                   'MultiModality': OrderedDict({})})
+                                   'MultiModality': OrderedDict({}),
+                                   'Geodesic': OrderedDict({})})
         for replication in range(replication_times):
             motion_loaders = {}
             mm_motion_loaders = {}
@@ -301,6 +394,16 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
                 print(f'Time: {datetime.now()}')
                 print(f'Time: {datetime.now()}', file=f, flush=True)
                 mm_score_dict = evaluate_multimodality(eval_wrapper, mm_motion_loaders, f, mm_num_times)
+
+            # Evaluate geodesic distance for rotation quality
+            geo_score_dict = {}
+            if run_geodesic:
+                print(f'Time: {datetime.now()}')
+                print(f'Time: {datetime.now()}', file=f, flush=True)
+                for model_name, gen_loader in motion_loaders.items():
+                    if model_name != 'ground truth':
+                        geo_result = evaluate_geodesic(gt_loader, gen_loader, f)
+                        geo_score_dict[model_name] = geo_result['mean']
 
             print(f'!!! DONE !!!')
             print(f'!!! DONE !!!', file=f, flush=True)
@@ -335,6 +438,12 @@ def evaluation(eval_wrapper, gt_loader, eval_motion_loaders, log_file, replicati
                     else:
                         all_metrics['MultiModality'][key] += [item]
 
+            if run_geodesic:
+                for key, item in geo_score_dict.items():
+                    if key not in all_metrics['Geodesic']:
+                        all_metrics['Geodesic'][key] = [item]
+                    else:
+                        all_metrics['Geodesic'][key] += [item]
 
         # print(all_metrics['Diversity'])
         mean_dict = {}
