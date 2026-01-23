@@ -1,41 +1,51 @@
-avec geo:
+## Modifications apportées
 
-========== Matching Score Summary ==========
----> [ground truth] Mean: 3.2356 CInterval: 0.0074
----> [vald] Mean: 3.4813 CInterval: 0.0132
-========== R_precision Summary ==========
----> [ground truth](top 1) Mean: 0.4530 CInt: 0.0031;(top 2) Mean: 0.6589 CInt: 0.0025;(top 3) Mean: 0.7681 CInt: 0.0018;
----> [vald](top 1) Mean: 0.4166 CInt: 0.0049;(top 2) Mean: 0.6228 CInt: 0.0045;(top 3) Mean: 0.7430 CInt: 0.0053;
-========== FID Summary ==========
----> [vald] Mean: 1.4319 CInterval: 0.1047
-========== Diversity Summary ==========
----> [ground truth] Mean: 9.2518 CInterval: 0.0834
----> [vald] Mean: 9.9914 CInterval: 0.0914
+### `diffusion/losses.py`
 
+- Ajout des fonctions pour convertir entre vecteurs 6D et quaternions  
+- Ajout des fonctions pour les opérations entre quaternions (inverse, multiplication)  
+- Ajout de la distance géodésique  
 
-Sans geo:
+### `diffusion/gaussian_diffusion.py`
 
-========== Matching Score Summary ==========
----> [ground truth] Mean: 3.2356 CInterval: 0.0074
----> [vald] Mean: 3.3255 CInterval: 0.0173
-========== R_precision Summary ==========
----> [ground truth](top 1) Mean: 0.4530 CInt: 0.0031;(top 2) Mean: 0.6589 CInt: 0.0025;(top 3) Mean: 0.7681 CInt: 0.0018;
----> [vald](top 1) Mean: 0.4399 CInt: 0.0056;(top 2) Mean: 0.6493 CInt: 0.0046;(top 3) Mean: 0.7681 CInt: 0.0043;
-========== FID Summary ==========
----> [vald] Mean: 1.1758 CInterval: 0.0823
-========== Diversity Summary ==========
----> [ground truth] Mean: 9.2518 CInterval: 0.0834
----> [vald] Mean: 10.0201 CInterval: 0.0844
+- intégration de la loss géodésique  
+- intégration de pondération en fonction du stade de débruitage  
 
-========== Matching Score Summary ==========
----> [ground truth] Mean: 3.2356 CInterval: 0.0074
----> [vald] Mean: 3.6202 CInterval: 0.0190
-========== R_precision Summary ==========
----> [ground truth](top 1) Mean: 0.4530 CInt: 0.0031;(top 2) Mean: 0.6589 CInt: 0.0025;(top 3) Mean: 0.7681 CInt: 0.0018;
----> [vald](top 1) Mean: 0.4012 CInt: 0.0060;(top 2) Mean: 0.5996 CInt: 0.0042;(top 3) Mean: 0.7218 CInt: 0.0051;
-========== FID Summary ==========
----> [vald] Mean: 1.7048 CInterval: 0.1199
-========== Diversity Summary ==========
----> [ground truth] Mean: 9.2518 CInterval: 0.0834
----> [vald] Mean: 9.9904 CInterval: 0.0938
-========== MultiModality Summary ==========
+### `utils/parser_util.py`
+
+- ajout du paramètre lambda_geo  
+
+### `eval/eval_humanml.py`
+
+- ajout d'une métrique dédiée à la distance géodésique (degrés)  
+
+## Bilan
+
+Nous avons commencé par vérifier la reproductibilité de MDM, nous avons téléchargé et configuré les bases comme indiqué dans le github.
+
+Ensuite, nous nous sommes intéressés à l'évaluation, après un peu de debugging nous avons réussi à reproduire les résultats présentés dans le papier.
+
+Enfin, avant de commencer à apporter nos modifications, nous avons lancé un entraînement pour s'assurer que tout fonctionne.
+
+Nous avons ensuite regardé les dossiers/fichiers les plus importants pour comprendre comment le modèle fonctionnait. Nous avions ensuite une semaine pour apporter nos modifications et les évaluer. 
+
+Après 3 jours d'ajout/debuggage, nous avons réussi à lancer un entraînement sans erreurs. Mais nous nous sommes rendu compte qu'un entraînement complet prend 2–3 jours, ce qui nous a conduits à fortement réduire le nombre de steps, de 600k à 50k.
+
+Nous avons lancé 3 entraînements :
+
+- un sans modifications pour pouvoir comparer à 50k  
+- un avec notre nouvelle loss géodésique (approche simple, lambda_geo=0.1)  
+- un avec notre loss + pondération en fonction du stade de débruitage  
+
+Comme le nombre de steps est bien trop petit pour avoir des résultats conclusifs, nous avons quand même ces observations :
+
+En se basant sur le FID (étant une métrique qui mesure la similitude à la distribution réelle), on remarque que notre loss augmente le score (de 1.1, à 1.4/1.7). Nous avons donc eu l'idée d'ajouter une métrique orientée géodésique, et nous avons obtenu une amélioration de 50 degrés en moyenne à 46. Nous pensons que ces résultats seront meilleurs si nous lançons un entraînement à 600k steps.
+
+## Pistes d'améliorations
+
+Les résultats que nous avons obtenus ne nous permettent pas de savoir si  cette nouvelle loss apporte un quelconque bénéfice, cependant, nous pensons que cette loss peut être pertinente au modèle avec un peu plus de travail, comme:
+
+- exclure la loss rot_mse pour les rotations (au lieu de les ajouter)  
+- faire la diffusion sur SO(3)  
+- essayer ces modifications sur le modèle de 1000 diffusion_steps (nous avons travaillé avec celui de 50 diffusion_steps pour plus de rapidité)  
+- entraînement sur 600k steps pour avoir des résultats concrets  
